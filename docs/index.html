@@ -66,6 +66,20 @@ p{max-width:64ch}
 .btn.solid{background:var(--gold);border-color:var(--gold);color:var(--ink)}
 .btn.solid:hover{background:var(--gold-hi);border-color:var(--gold-hi)}
 .btn:disabled{opacity:.3;cursor:default}
+.btn .st{color:var(--gold-hi);font-size:13px;letter-spacing:0}
+.btn.solid .st{color:var(--ink)}
+nav a.star-pill{color:var(--gold-hi);border:1px solid rgba(207,176,122,.45);padding:7px 12px 7px 10px}
+nav a.star-pill:hover{background:rgba(207,176,122,.1);border-color:var(--gold-hi)}
+.free{margin-top:22px;font:400 10.5px/1.6 var(--sans);letter-spacing:.36em;text-transform:uppercase;color:var(--mist)}
+.free a{color:var(--gold);text-decoration:none}
+.free a:hover{color:var(--gold-hi)}
+.altar{text-align:center;display:grid;justify-items:center;gap:22px;padding:24px 0 8px}
+.altar h2{font:400 clamp(40px,6vw,84px)/1.02 var(--display);color:var(--ivory)}
+.altar h2 i{font-style:italic;color:var(--gold-hi)}
+.altar p{margin:0;color:var(--mist);max-width:46ch}
+.claim{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:18px 28px;margin-top:32px;padding:26px 0;border-block:1px solid rgba(207,176,122,.22)}
+.claim span{font:italic 400 clamp(22px,2.4vw,30px)/1.2 var(--display);color:var(--ivory)}
+.claim .acts{display:flex;flex-wrap:wrap;gap:12px}
 
 /* hero */
 .hero{display:grid;justify-items:center;text-align:center;gap:0;padding-top:8px}
@@ -247,8 +261,9 @@ p{max-width:64ch}
     <p class="lead">Claude Code is an AI that writes code on your computer. Moirai makes sure it starts smart, spends wisely, stops in time, tells the truth and keeps your secrets.</p>
     <div class="cta">
       <a class="btn solid" href="#journey" data-go="journey">Follow the thread</a>
-      <a class="btn" href="#why" data-go="why">Why it exists</a>
+      <a class="btn" href="https://github.com/GeneralDussDuss/moirai" target="_blank" rel="noopener">Get it for yourself</a>
     </div>
+    <p class="free">Free &amp; open source · <a href="https://github.com/GeneralDussDuss/moirai" target="_blank" rel="noopener">★ Star it on GitHub</a> if the Fates smile on you</p>
   </div>
 
   <div class="pin"></div>
@@ -259,9 +274,20 @@ p{max-width:64ch}
   <div class="pin"></div>
   <div class="specs">
     <div><b>5</b><span>Plugins · each stands alone</span></div>
-    <div><b>294</b><span>Automated checks</span></div>
+    <div><b>300+</b><span>Automated checks</span></div>
     <div><b>0</b><span>Dependencies</span></div>
     <div><b>100%</b><span>Fail-open · never breaks a session</span></div>
+  </div>
+
+  <div class="pin"></div>
+  <div class="altar">
+    <p class="over" style="margin:0">Claim the thread</p>
+    <h2>Give your agent <i>its Fates.</i></h2>
+    <p>Free, open source and one command away. A star helps other builders find it.</p>
+    <div class="cta" style="margin-top:6px">
+      <a class="btn solid" href="https://github.com/GeneralDussDuss/moirai" target="_blank" rel="noopener">Get Moirai for yourself</a>
+      <a class="btn" href="https://github.com/GeneralDussDuss/moirai" target="_blank" rel="noopener"><span class="st">★</span> Star on GitHub</a>
+    </div>
   </div>
 </section>
 
@@ -298,8 +324,13 @@ p{max-width:64ch}
 <section class="page" id="p-get">
   <p class="over">Receive</p>
   <h2 class="sec-h">Six lines, and your agent <i>answers to the Fates.</i></h2>
-  <p style="margin-top:36px"><span class="status">In the atelier · release soon</span></p>
-  <p class="lead" style="margin-top:22px">The pack is built and tested. It comes down from the mountain to GitHub once it has proven itself in real work.</p>
+  <p style="margin-top:36px"><span class="status">Now on GitHub · v0.1 · testers wanted</span></p>
+  <p class="lead" style="margin-top:22px">The pack has come down from the mountain. Install it, push it hard, and tell us what the Fates got wrong.</p>
+  <div class="cta" style="justify-content:flex-start;margin-top:30px">
+    <a class="btn solid" href="https://github.com/GeneralDussDuss/moirai" target="_blank" rel="noopener">Open the repo</a>
+    <a class="btn" href="https://github.com/GeneralDussDuss/moirai" target="_blank" rel="noopener"><span class="st">★</span> Leave an offering · star it</a>
+    <a class="btn" href="https://github.com/GeneralDussDuss/moirai/blob/main/TESTING.md" target="_blank" rel="noopener">Become a tester</a>
+  </div>
   <div class="two">
     <div class="velvet"><p class="cap">Install inside Claude Code</p>
       <div class="cmds" id="cmds"></div>
@@ -318,7 +349,7 @@ p{max-width:64ch}
 </section>
 
 <div class="pager" id="pager"></div>
-<p class="foot">Terminal scenes are dramatized from real test runs · Keys 0–9 · ← → · R replays</p>
+<p class="foot"><a href="https://github.com/GeneralDussDuss/moirai" target="_blank" rel="noopener" style="color:var(--gold);text-decoration:none">★ Star Moirai on GitHub</a> · Terminal scenes are dramatized from real test runs · Keys 0–9 · ← → · R replays</p>
 </div>
 
 <script>
@@ -429,7 +460,7 @@ function medal(id, name){
 /* ---------- build pages ---------- */
 const navLink = id => `<a href="#${id}" data-go="${id}">${LABEL[id]||byId[id].name}</a>`;
 $("#navl").innerHTML = ["home","why","journey"].map(navLink).join("");
-$("#navr").innerHTML = [...P.map(p=>p.id),"get"].map(navLink).join("");
+$("#navr").innerHTML = [...P.map(p=>p.id),"get"].map(navLink).join("") + `<a class="star-pill" href="https://github.com/GeneralDussDuss/moirai" target="_blank" rel="noopener">★ Star</a>`;
 $("#lineup").innerHTML = P.map(p=>`<a class="model" href="#${p.id}" data-go="${p.id}" style="--c:${p.c}">${medal(p.id,p.name)}
   <span class="nm"><span>${p.role}</span><b>${p.name}</b></span><p class="d">${p.short}</p><span class="go">Discover</span></a>`).join("");
 $("#sins").innerHTML = FAILS.map(f=>{const p=byId[f.who];return `<div class="sin">${medal(p.id,p.name)}<div><h3>${f.h}</h3><p>${f.p}</p><a href="#${p.id}" data-go="${p.id}">${p.name} answers this</a></div></div>`}).join("");
@@ -446,6 +477,9 @@ $("#model-pages").innerHTML = P.map(p=>`<section class="page" id="p-${p.id}" sty
   <div class="velvet" style="margin-top:32px"><p class="cap">What it does</p>
     <ul class="gifts">${p.does.map(d=>`<li>${d}</li>`).join("")}</ul>
     <div class="seals">${p.meta.map(m=>`<span><b>${m[0]}</b>${m[1]}</span>`).join("")}</div></div>
+  <div class="claim"><span>Put ${p.name} to work on your machine.</span><div class="acts">
+    <a class="btn solid" href="https://github.com/GeneralDussDuss/moirai/tree/main/plugins/${p.id}" target="_blank" rel="noopener">Get ${p.name} for yourself</a>
+    <a class="btn" href="https://github.com/GeneralDussDuss/moirai" target="_blank" rel="noopener"><span class="st">★</span> Star the pack</a></div></div>
 </section>`).join("");
 
 const CMDS = ["/plugin marketplace add GeneralDussDuss/moirai", ...P.map(p=>`/plugin install ${p.id}@moirai`)];
