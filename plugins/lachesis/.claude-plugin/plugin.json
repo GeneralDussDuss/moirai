@@ -1,0 +1,7 @@
+{
+  "name": "lachesis",
+  "version": "0.3.0",
+  "description": "Measures the thread and gives each task the model it deserves: a routing policy, a Haiku scout and Sonnet worker, one-turn /quick and /cheap, a usage audit, and a status line meter.",
+  "author": { "name": "badussy" },
+  "license": "MIT"
+}

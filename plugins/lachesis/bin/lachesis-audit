@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""Lachesis audit: where did the expensive models' work actually go?
+
+Reads Claude Code transcripts (~/.claude/projects/**.jsonl, including
+subagents), prices every API call at list rates, classifies what each call
+did, and finds the work an expensive model (Opus, Fable) did that a cheaper
+one could have done:
+
+  scout runs     3+ consecutive calls that only read/search/inspect, each
+                 with little reasoning. A Haiku helper could have done it.
+  mechanical     3+ consecutive calls doing small edits or commands with
+                 little reasoning. A Sonnet helper could likely have done it.
+  quick turns    a whole user turn of at most 2 calls with short output,
+                 e.g. a lookup. A one-turn /quick on Haiku would do.
+
+Usage: lachesis-audit [--days N] [--project SUBSTR] [--top N] [--json]
+
+Costs are list-price estimates for comparing models, not a bill: on a
+subscription they show where plan headroom goes. Savings estimates assume a
+helper starts from a fresh ~20k-token context and hands back a short summary.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+
+PROJECTS = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "projects")
+
+# $ per million tokens: input, output, cache read. Cache writes are priced
+# from input: 1.25x (5 min) and 2x (1 hour). Source: the claude-api skill's
+# model table, cached 2026-10-06. Haiku 5.5 cache read assumed at 0.1x.
+PRICES = {
+    "claude-fable-5-1": (10.00, 50.00, 0.25),
+    "claude-fable-5": (10.00, 50.00, 1.00),
+    "claude-opus-5-5": (4.00, 20.00, 0.20),
+    "claude-opus-5": (5.00, 25.00, 0.50),
+    "claude-opus-4-8": (5.00, 25.00, 0.50),
+    "claude-sonnet-5-5": (2.00, 10.00, 0.20),
+    "claude-sonnet-5": (2.00, 10.00, 0.20),
+    "claude-haiku-5-5": (0.10, 0.50, 0.01),
+}
+TIER = {"fable": "expensive", "opus": "expensive", "sonnet": "mid", "haiku": "cheap"}
+CHEAP, MID = "claude-haiku-5-5", "claude-sonnet-5-5"
+
+READ_TOOLS = {"Read", "Grep", "Glob", "LS", "WebFetch", "WebSearch", "ToolSearch", "ListAgents",
+              "TaskGet", "TaskList", "ListMcpResourcesTool", "ReadMcpResourceTool", "Monitor"}
+WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+DELEGATE_TOOLS = {"Agent", "Workflow", "SendMessage", "Task"}
+# Shell commands that only look: the first word of every pipeline stage.
+READ_CMDS = {
+    "ls", "cat", "head", "tail", "grep", "rg", "find", "fd", "wc", "stat", "file", "jq", "sed", "awk",
+    "sort", "uniq", "cut", "tr", "column", "diff", "cmp", "which", "type", "command", "echo", "printf",
+    "pwd", "date", "du", "df", "ps", "pgrep", "lsof", "ss", "ip", "free", "uptime", "env", "printenv",
+    "id", "whoami", "hostname", "uname", "lspci", "lsusb", "lsblk", "journalctl", "coredumpctl",
+    "readlink", "realpath", "basename", "dirname", "tree", "less", "od", "xxd", "md5sum", "sha256sum",
+    "identify", "true", "test", "[", "timeout", "for", "do", "done", "if", "then", "fi", "while", "read",
+}
+READ_SUBCMDS = {
+    "git": {"status", "log", "diff", "show", "branch", "remote", "rev-parse", "ls-files", "blame"},
+    "pacman": {"-Q", "-Qi", "-Ql", "-Qs", "-Si", "-Ss", "-Qo"},
+    "systemctl": {"status", "is-active", "is-enabled", "list-units", "show", "cat", "--user"},
+    "claude": {"plugin"},
+    "magick": {"identify", "compare"},
+}
+
+QUICK_OUT = 1500        # output tokens: a call this small did little reasoning
+RUN_MIN = 3             # consecutive calls before a run is worth delegating
+HELPER_CONTEXT = 20000  # a fresh helper's starting context (system prompt + tools)
+HANDOFF_OUT = 400       # main model's tokens to brief the helper
+HANDOFF_IN = 1500       # main model's tokens to read the helper's summary
+REBUILD = 30000         # a call writing this much cache is rebuilding context, not doing work
+HEAVY_CTX = 200000      # context size where every small step gets expensive
+
+
+def price(model):
+    for k, v in PRICES.items():
+        if model == k or model.startswith(k + "-"):
+            return v
+    return None
+
+
+def tier(model):
+    for k, t in TIER.items():
+        if k in model:
+            return t
+    return "unknown"
+
+
+def call_cost(model, u):
+    p = price(model)
+    if not p:
+        return 0.0
+    inp, out, read = p
+    cc = u.get("cache_creation") or {}
+    w1h = cc.get("ephemeral_1h_input_tokens", 0) or 0
+    w5m = cc.get("ephemeral_5m_input_tokens", 0) or 0
+    if not cc:
+        w5m = u.get("cache_creation_input_tokens", 0) or 0
+    return ((u.get("input_tokens", 0) or 0) * inp + w5m * inp * 1.25 + w1h * inp * 2
+            + (u.get("cache_read_input_tokens", 0) or 0) * read + (u.get("output_tokens", 0) or 0) * out) / 1e6
+
+
+PY_WRITES = re.compile(r"open\([^)]*,\s*(mode\s*=\s*)?['\"][wax]|\.write(_text|_bytes)?\(|unlink|rmtree|os\.remove|\.rename\("
+                       r"|subprocess|shutil\.(copy|move)|os\.system|\.mkdir\(")
+NEUTRAL = {"cd", "set", "sleep", "local", "export", "source", ".", "mktemp", "shopt", "trap", "wait", "break",
+           "continue", "return", "exit", "else", "elif", "case", "esac", "in", "{", "}", "(", ")", "!", "time"}
+
+
+def cost_parts(model, u):
+    """The call's cost split into fresh input, cache writes, cache reads, output."""
+    p = price(model)
+    if not p:
+        return {"input": 0.0, "write": 0.0, "read": 0.0, "output": 0.0}
+    inp, out, read = p
+    cc = u.get("cache_creation") or {}
+    w = ((cc.get("ephemeral_1h_input_tokens", 0) or 0) * 2 + (cc.get("ephemeral_5m_input_tokens", 0) or 0) * 1.25
+         if cc else (u.get("cache_creation_input_tokens", 0) or 0) * 1.25)
+    return {"input": (u.get("input_tokens", 0) or 0) * inp / 1e6, "write": w * inp / 1e6,
+            "read": (u.get("cache_read_input_tokens", 0) or 0) * read / 1e6,
+            "output": (u.get("output_tokens", 0) or 0) * out / 1e6}
+
+
+def bash_is_read(cmd):
+    """True when a shell command only looks: no files written, nothing changed."""
+    # Heredoc bodies are data (often a script); judge a python body by what it does.
+    bodies = []
+    def keep_body(m):
+        bodies.append(m.group(3))
+        return " "
+    cmd = re.sub(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n(.*?)\n\s*\2\b", keep_body, cmd, flags=re.S)
+    if any(PY_WRITES.search(b) for b in bodies):
+        return False
+    # Quoted strings can hold anything (jq filters, Lua, sed scripts): blank them.
+    cmd = re.sub(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"", "''", cmd)
+    if re.search(r"(^|[^>&0-9])>>?\s*[^&\s/]|>\s*/(?!dev/null)", cmd):
+        return False  # redirects output into a file
+    cmd = cmd.replace("$(", ";").replace("`", ";")
+    for stage in re.split(r"\|\||&&|[|;\n()]", cmd):
+        words = stage.strip().split()
+        while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
+            words = words[1:]  # VAR=value prefixes and assignments
+        if not words:
+            continue
+        w = os.path.basename(words[0])
+        if w in ("sudo", "doas", "rm", "mv", "kill", "pkill", "dd", "chmod", "chown"):
+            return False
+        if w in NEUTRAL or w in READ_CMDS or "--help" in words or "--version" in words:
+            if w == "sed" and "-i" in words:
+                return False
+            continue
+        if w in READ_SUBCMDS and len(words) > 1 and words[1] in READ_SUBCMDS[w]:
+            continue
+        if w == "curl" and not re.search(r"\s-(X|d|F|T)\b|--data|--upload|-o\s", stage):
+            continue  # a plain GET is a fetch
+        if w in ("grim", "top", "glxinfo", "vulkaninfo", "nvtop", "sensors", "pw-dump", "wpctl") and \
+                not (w == "wpctl" and len(words) > 1 and words[1].startswith("set")):
+            continue
+        if w in ("python3", "python") and (bodies or "-c" in words):
+            continue  # inline script with no write markers (checked above)
+        return False
+    return True
+
+
+def classify(blocks):
+    """What one API call did: answer, read, write, delegate, ask, or mixed."""
+    kinds = set()
+    for b in blocks:
+        if b.get("type") != "tool_use":
+            continue
+        name, inp = b.get("name", ""), b.get("input") or {}
+        if name == "Bash":
+            kinds.add("read" if bash_is_read(inp.get("command", "")) else "write")
+        elif name in READ_TOOLS or name.startswith("mcp__") and any(
+                x in name for x in ("snapshot", "read", "list", "get", "search", "find", "query", "console")):
+            kinds.add("read")
+        elif name in WRITE_TOOLS:
+            kinds.add("write")
+        elif name in DELEGATE_TOOLS:
+            kinds.add("delegate")
+        elif name == "AskUserQuestion":
+            kinds.add("ask")
+        else:
+            kinds.add("other")
+    if not kinds:
+        return "answer"
+    if len(kinds) == 1:
+        return kinds.pop()
+    return "write" if kinds <= {"read", "write"} else "mixed"
+
+
+def prompt_text(content):
+    if isinstance(content, str):
+        return content
+    return " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
+
+
+def load_calls(path, since):
+    """Merge each API response's split lines into one call, in order."""
+    calls, by_id, prompt = [], {}, None
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            ts = d.get("timestamp")
+            if ts and since and ts < since:
+                continue
+            t, m = d.get("type"), d.get("message") or {}
+            if t == "user" and not d.get("isMeta"):
+                text = prompt_text(m.get("content"))
+                is_tool_result = isinstance(m.get("content"), list) and any(
+                    isinstance(c, dict) and c.get("type") == "tool_result" for c in m["content"])
+                if text.strip() and not is_tool_result and not text.lstrip().startswith("<"):
+                    prompt = {"text": " ".join(text.split())[:90], "ts": ts}
+                continue
+            if t != "assistant" or not m.get("id") or not m.get("model") or m["model"].startswith("<"):
+                continue
+            c = by_id.get(m["id"])
+            if c is None:
+                c = {"id": m["id"], "model": m["model"], "usage": m.get("usage") or {}, "blocks": [],
+                     "ts": ts, "prompt": prompt, "file": path}
+                by_id[m["id"]] = c
+                calls.append(c)
+            c["blocks"].extend(m.get("content") or [])
+    for c in calls:
+        c["kind"] = classify(c["blocks"])
+        c["cost"] = call_cost(c["model"], c["usage"])
+        c["parts"] = cost_parts(c["model"], c["usage"])
+        c["out"] = c["usage"].get("output_tokens", 0) or 0
+        u = c["usage"]
+        c["new_in"] = (u.get("input_tokens", 0) or 0) + (u.get("cache_creation_input_tokens", 0) or 0)
+    return calls
+
+
+IMAGE_TOKENS = 1500  # rough: a screenshot after Claude Code's downscaling
+SKILL_MARK = "Base directory for this skill"
+
+
+def context_profile(path, since):
+    """What filled one session's context, weighted by how often it was re-read.
+
+    A chunk added at step i is re-sent on every later step, so its re-read cost is
+    tokens x steps remaining x the model's cache-read price. Sizes are estimates
+    (about 4 characters per token; images at IMAGE_TOKENS).
+    """
+    added, step, names, model, first, peak, base = [], 0, {}, None, None, 0, 0
+    seen = set()
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if since and (d.get("timestamp") or "") < since:
+                continue
+            t, m = d.get("type"), d.get("message") or {}
+            if t == "assistant" and m.get("model") and not m["model"].startswith("<"):
+                if m.get("id") not in seen:
+                    seen.add(m.get("id"))
+                    step += 1
+                    model = model or m["model"]
+                    u = m.get("usage") or {}
+                    ctx = sum((u.get(k) or 0) for k in
+                              ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+                    peak = max(peak, ctx)
+                    base = base or ctx  # the first call's context is mostly Claude Code's own
+                for b in m.get("content") or []:
+                    if b.get("type") == "tool_use":
+                        inp = b.get("input") or {}
+                        names[b.get("id")] = b.get("name", "?")
+                        body = inp.get("content") or inp.get("new_string") or ""
+                        if b.get("name") in WRITE_TOOLS and body:
+                            added.append(("files you wrote", len(body) / 4, step))
+                    elif b.get("type") == "text" and b.get("text"):
+                        added.append(("replies to you", len(b["text"]) / 4, step))
+            elif t == "user":
+                content = m.get("content")
+                if isinstance(content, str):
+                    text = content
+                    kind = "skill/reference loads" if SKILL_MARK in text[:200] else "your messages"
+                    added.append((kind, len(text) / 4, step))
+                    if first is None and kind == "your messages" and not text.lstrip().startswith("<"):
+                        first = " ".join(text.split())[:60]
+                    continue
+                for c in content or []:
+                    if not isinstance(c, dict):
+                        continue
+                    if c.get("type") == "text":
+                        text = c.get("text", "")
+                        kind = "skill/reference loads" if SKILL_MARK in text[:200] else "your messages"
+                        added.append((kind, len(text) / 4, step))
+                        if first is None and kind == "your messages" and not text.lstrip().startswith("<"):
+                            first = " ".join(text.split())[:60]
+                    elif c.get("type") == "tool_result":
+                        tool = names.get(c.get("tool_use_id"), "?")
+                        inner = c.get("content")
+                        items = inner if isinstance(inner, list) else [{"type": "text", "text": str(inner or "")}]
+                        for x in items:
+                            if x.get("type") == "image":
+                                added.append(("screenshots/images", IMAGE_TOKENS, step))
+                            elif x.get("type") == "text":
+                                label = "skill/reference loads" if tool == "Skill" else f"{tool} output"
+                                added.append((label, len(x.get("text", "")) / 4, step))
+    if step < 2 or not model or not price(model):
+        return None
+    read = price(model)[2]
+    by = defaultdict(lambda: [0.0, 0.0])  # tokens, re-read $
+    for kind, tokens, at in added:
+        by[kind][0] += tokens
+        by[kind][1] += tokens * max(0, step - at) * read / 1e6
+    # Claude Code's instructions and tool definitions ride along on every step.
+    by["Claude Code base (fixed)"] = [base, base * step * read / 1e6]
+    return {"file": path, "steps": step, "peak": peak, "model": model, "first": first or "?",
+            "reread": sum(v[1] for v in by.values()), "by": dict(by)}
+
+
+def helper_cost(run, model):
+    """Rough cost of the same run done by a helper on `model`, plus the hand-off."""
+    inp, out, read = price(model)
+    ctx, total = HELPER_CONTEXT, 0.0
+    for c in run:
+        total += (ctx * read + c["new_in"] * inp * 2 + c["out"] * out) / 1e6
+        ctx += c["new_in"]
+    mi, mo, _ = price(run[0]["model"])
+    return total + (HANDOFF_OUT * mo + HANDOFF_IN * mi * 2) / 1e6
+
+
+def find_runs(turn):
+    runs, cur, cur_kind = [], [], None
+    for c in turn:
+        k = c["kind"]
+        fits = (tier(c["model"]) == "expensive" and c["out"] <= QUICK_OUT and k in ("read", "write")
+                and c["new_in"] < REBUILD)
+        group = "scout" if k == "read" else "mechanical"
+        if fits and (not cur or group == cur_kind or (cur_kind == "mechanical" and group == "scout")):
+            cur.append(c)
+            cur_kind = cur_kind or group
+        else:
+            if len(cur) >= RUN_MIN:
+                runs.append((cur_kind, cur))
+            cur, cur_kind = ([c], group) if fits else ([], None)
+    if len(cur) >= RUN_MIN:
+        runs.append((cur_kind, cur))
+    return runs
+
+
+def print_hogs(profiles, top):
+    """What bloated the context, across sessions and in the worst ones."""
+    if not profiles:
+        return
+    total = defaultdict(lambda: [0.0, 0.0])
+    for p in profiles:
+        for k, (tok, cost) in p["by"].items():
+            total[k][0] += tok
+            total[k][1] += cost
+    spent = sum(v[1] for v in total.values())
+    print(f"\nContext hogs: what got re-read (a chunk costs size x the steps after it), ${spent:.2f} attributed")
+    print("  (thinking also stays in context but isn't visible in transcripts, so it's not counted)")
+    for k, (tok, cost) in sorted(total.items(), key=lambda kv: -kv[1][1])[:8]:
+        print(f"  {k:<26}{tok / 1000:>7.0f}k tok{'$%.2f' % cost:>9}{cost / spent if spent else 0:>6.0%}")
+    print("  heaviest sessions:")
+    for p in profiles[:min(top, 5)]:
+        worst = sorted(p["by"].items(), key=lambda kv: -kv[1][1])[:3]
+        hogs = ", ".join(f"{k} ${c:.2f}" for k, (_, c) in worst)
+        print(f"    {p['steps']:>4} steps, peak {p['peak'] // 1000}k, re-read ${p['reread']:.2f}  "
+              f"\"{p['first'][:40]}\"  <- {hogs}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--days", type=float, help="only the last N days")
+    ap.add_argument("--project", help="only transcript folders containing this text")
+    ap.add_argument("--top", type=int, default=8)
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    since = None
+    if a.days:
+        since = (datetime.now(timezone.utc) - timedelta(days=a.days)).strftime("%Y-%m-%dT%H:%M:%S")
+    files = sorted(glob.glob(f"{PROJECTS}/*/*.jsonl") + glob.glob(f"{PROJECTS}/*/*/subagents/*.jsonl"))
+    if a.project:
+        files = [f for f in files if a.project in f]
+
+    all_calls, runs, quick, profiles = [], [], [], []
+    for f in files:
+        if "/subagents/" not in f:
+            prof = context_profile(f, since)
+            if prof:
+                profiles.append(prof)
+        calls = load_calls(f, since)
+        all_calls += calls
+        turns = defaultdict(list)
+        for c in calls:
+            turns[id(c["prompt"])].append(c)
+        for turn in turns.values():
+            runs += [(kind, r, f) for kind, r in find_runs(turn)]
+            if ("/subagents/" not in f and len(turn) <= 2 and tier(turn[0]["model"]) == "expensive"
+                    and sum(c["out"] for c in turn) <= 800 and turn[0]["prompt"]):
+                quick.append(turn)
+
+    if not all_calls:
+        sys.exit("no calls found")
+
+    by_model = defaultdict(lambda: {"calls": 0, "cost": 0.0, "out": 0})
+    by_kind = defaultdict(lambda: {"calls": 0, "cost": 0.0})
+    for c in all_calls:
+        s = by_model[c["model"]]
+        s["calls"] += 1; s["cost"] += c["cost"]; s["out"] += c["out"]
+        if tier(c["model"]) == "expensive":
+            k = by_kind[c["kind"]]
+            k["calls"] += 1; k["cost"] += c["cost"]
+    total = sum(s["cost"] for s in by_model.values())
+    parts = {k: sum(c["parts"][k] for c in all_calls) for k in ("input", "write", "read", "output")}
+    rebuilds = [c for c in all_calls if c["new_in"] >= REBUILD]
+    heavy = [c for c in all_calls if (c["usage"].get("cache_read_input_tokens", 0) or 0) >= HEAVY_CTX]
+    ctx_sizes = sorted((c["usage"].get("cache_read_input_tokens", 0) or 0) + c["new_in"]
+                       for c in all_calls if tier(c["model"]) == "expensive")
+    median_ctx = ctx_sizes[len(ctx_sizes) // 2] if ctx_sizes else 0
+    expensive = sum(s["cost"] for m, s in by_model.items() if tier(m) == "expensive")
+
+    scored = []
+    for kind, r, f in runs:
+        actual = sum(c["cost"] for c in r)
+        alt = helper_cost(r, CHEAP if kind == "scout" else MID)
+        scored.append({"kind": kind, "calls": len(r), "actual": actual, "helper": alt,
+                       "saving": max(0.0, actual - alt), "model": r[0]["model"],
+                       "prompt": (r[0]["prompt"] or {}).get("text", "?"), "ts": r[0]["ts"],
+                       "session": os.path.basename(f)[:8]})
+    scored.sort(key=lambda s: -s["saving"])
+    quick_cost = sum(c["cost"] for t in quick for c in t)
+    quick_alt = sum(call_cost(CHEAP, c["usage"]) for t in quick for c in t)
+    saving = sum(s["saving"] for s in scored) + max(0.0, quick_cost - quick_alt)
+
+    report = {
+        "files": len(files), "calls": len(all_calls), "total_cost": total, "expensive_cost": expensive,
+        "by_model": dict(by_model), "expensive_by_kind": dict(by_kind),
+        "runs": scored, "quick_turns": {"count": len(quick), "cost": quick_cost, "haiku_cost": quick_alt},
+        "estimated_saving": saving, "cost_parts": parts,
+        "rebuilds": {"count": len(rebuilds), "cost": sum(c["cost"] for c in rebuilds)},
+        "heavy_context": {"count": len(heavy), "cost": sum(c["cost"] for c in heavy),
+                          "read_cost": sum(c["parts"]["read"] for c in heavy)},
+        "median_context": median_ctx,
+        "context_hogs": sorted(profiles, key=lambda p: -p["reread"]),
+    }
+    if a.json:
+        print(json.dumps(report, indent=2, default=str))
+        return
+
+    span = f"last {a.days:g} days" if a.days else "all history"
+    print(f"Lachesis audit: {len(all_calls)} API calls in {len(files)} transcripts ({span})")
+    print(f"list-price total ${total:.2f}; Opus/Fable ${expensive:.2f} ({expensive / total:.0%})\n")
+    print(f"{'model':<20}{'calls':>7}{'share':>8}{'cost':>10}")
+    for m, s in sorted(by_model.items(), key=lambda kv: -kv[1]["cost"]):
+        print(f"{m:<20}{s['calls']:>7}{s['calls'] / len(all_calls):>8.0%}{'$%.2f' % s['cost']:>10}")
+    print("\nWhat Opus/Fable calls did:")
+    labels = {"read": "read/search/inspect", "write": "edit/run commands", "answer": "answer you (no tools)",
+              "delegate": "hand off to helpers", "ask": "ask you", "mixed": "mixed", "other": "other tools"}
+    for k, s in sorted(by_kind.items(), key=lambda kv: -kv[1]["cost"]):
+        print(f"  {labels.get(k, k):<24}{s['calls']:>6} calls{'$%.2f' % s['cost']:>10}")
+
+    print("\nWhere the cost comes from:")
+    for k, label in (("read", "re-reading context (cache reads)"), ("write", "writing context to cache"),
+                     ("output", "output and thinking"), ("input", "uncached input")):
+        print(f"  {label:<34}{'$%.2f' % parts[k]:>9}{parts[k] / total:>6.0%}")
+    rb = report["rebuilds"]; hv = report["heavy_context"]
+    print(f"  context rebuilds (>{REBUILD // 1000}k written at once): {rb['count']} calls, ${rb['cost']:.2f}")
+    print(f"  calls carrying >{HEAVY_CTX // 1000}k context: {hv['count']}, ${hv['cost']:.2f} "
+          f"(${hv['read_cost']:.2f} of it just re-reading); median Opus/Fable context {median_ctx // 1000}k")
+
+    print_hogs(report["context_hogs"], a.top)
+
+    n_scout = sum(1 for s in scored if s["kind"] == "scout")
+    print(f"\nDelegable runs: {len(scored)} ({n_scout} scout -> Haiku, {len(scored) - n_scout} mechanical -> Sonnet)")
+    print(f"  actual ${sum(s['actual'] for s in scored):.2f} vs helper estimate ${sum(s['helper'] for s in scored):.2f}")
+    for s in scored[:a.top]:
+        print(f"  {s['ts'][:16]} {s['kind']:<10}{s['calls']:>3} calls  ${s['actual']:.2f} -> ${s['helper']:.2f}  \"{s['prompt'][:60]}\"")
+    print(f"\nQuick turns (<=2 calls, short): {len(quick)}, ${quick_cost:.2f} on Opus/Fable, ${quick_alt:.2f} on Haiku")
+    print(f"\nEstimated saving: ${saving:.2f} of ${total:.2f} ({saving / total:.0%}) at list prices")
+
+
+if __name__ == "__main__":
+    main()

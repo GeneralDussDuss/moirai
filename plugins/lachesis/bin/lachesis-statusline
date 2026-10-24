@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Claude Code status line: model, effort, context weight, session cost, plan limits.
+
+  Opus · medium · ctx 120k · $4.21 · 5h 42% · 7d 18%
+
+Context turns yellow past 150k and red past 250k with a nudge, since every step
+re-reads it. Plan limits turn yellow at 70% and red at 90%. Registered as
+`statusLine` in ~/.claude/settings.json (plugins can't set it themselves).
+"""
+import json
+import os
+import sys
+
+YELLOW, RED, DIM, RESET = "\033[33m", "\033[31m", "\033[2m", "\033[0m"
+
+
+def color(text, value, warn, bad):
+    if value is None:
+        return text
+    return f"{RED}{text}{RESET}" if value >= bad else f"{YELLOW}{text}{RESET}" if value >= warn else text
+
+
+def get(d, *path):
+    for p in path:
+        if not isinstance(d, dict):
+            return None
+        d = d.get(p)
+    return d
+
+
+def setup():
+    path = os.path.realpath(__file__)
+    print(json.dumps({"statusLine": {"type": "command", "command": path}}, indent=2))
+    print("\nMerge the block above into ~/.claude/settings.json. The path points at this "
+          "install; plugin updates may move it, so re-run /lachesis:statusline if the bar disappears.")
+
+
+def main():
+    if "--setup" in sys.argv[1:]:
+        return setup()
+    try:
+        s = json.load(sys.stdin)
+    except ValueError:
+        print("lachesis: no status")
+        return
+    parts = [get(s, "model", "display_name") or get(s, "model", "id") or "?"]
+
+    effort = get(s, "effort", "level")
+    if effort:
+        parts.append(effort)
+
+    usage = get(s, "context_window", "current_usage")
+    if isinstance(usage, dict):
+        ctx = sum((usage.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+        text = f"ctx {ctx // 1000}k"
+        if ctx >= 250_000:
+            text += " → delegate or /compact"
+        parts.append(color(text, ctx, 150_000, 250_000))
+
+    cost = get(s, "cost", "total_cost_usd")
+    if cost is not None:
+        parts.append(f"${cost:.2f}")
+
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        pct = get(s, "rate_limits", key, "used_percentage")
+        if pct is not None:
+            parts.append(color(f"{label} {pct:.0f}%", pct, 70, 90))
+
+    print(f" {DIM}·{RESET} ".join(parts))
+
+
+if __name__ == "__main__":
+    main()

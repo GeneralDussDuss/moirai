@@ -1,0 +1,17 @@
+{
+  "description": "Lachesis: load the model-routing policy into every session",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/session-start\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

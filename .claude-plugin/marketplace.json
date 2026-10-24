@@ -4,6 +4,7 @@
   "description": "The Fates for Claude Code: spin, measure and cut every session, with Aletheia watching the claims and Cerberus at the gate.",
   "owner": { "name": "badussy" },
   "plugins": [
+    { "name": "lachesis", "source": "./plugins/lachesis", "category": "productivity", "description": "Measures the thread: routes each step to the cheapest model that can do it well" },
     { "name": "clotho",   "source": "./plugins/clotho",   "category": "productivity", "description": "Spins the thread: session handoffs that survive /clear and compaction" },
     { "name": "atropos",  "source": "./plugins/atropos",  "category": "productivity", "description": "Cuts the thread: stops loops, runaway context and blown budgets" },
     { "name": "aletheia",    "source": "./plugins/aletheia",    "category": "development",  "description": "Truth in Claude's claims: no 'tests pass' without a test run" },

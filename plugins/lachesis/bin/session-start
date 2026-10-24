@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""SessionStart hook: load the routing policy into the session's context.
+Runs on startup, resume, /clear and after compaction. Fails open."""
+import json, os, sys
+try:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "policy.md")
+    with open(path) as f:
+        ctx = f.read()
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
+except Exception:
+    pass

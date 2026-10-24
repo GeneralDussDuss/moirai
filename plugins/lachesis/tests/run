@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Lachesis tests: hook output, status line, audit on a fixture, manifests, no personal data."""
+import json, os, re, subprocess, sys, tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.normpath(os.path.join(HERE, ".."))
+BIN = os.path.join(ROOT, "bin")
+tmp = tempfile.mkdtemp()
+fails = 0
+
+def check(name, cond, extra=""):
+    global fails
+    print(("ok   " if cond else "FAIL ") + name + ("" if cond else "  " + str(extra)))
+    fails += not cond
+
+def run(script, *a, inp=None, env=None):
+    return subprocess.run([os.path.join(BIN, script), *a], input=inp, capture_output=True, text=True,
+                          env=dict(os.environ, **(env or {})))
+
+# manifests
+for rel in (".claude-plugin/plugin.json", "hooks/hooks.json"):
+    try:
+        json.load(open(os.path.join(ROOT, rel))); check(rel + " parses", True)
+    except Exception as e:
+        check(rel + " parses", False, e)
+meta = json.load(open(os.path.join(ROOT, ".claude-plugin/plugin.json")))
+check("plugin.json name/version/license", meta["name"] == "lachesis" and meta["version"] == "0.3.0"
+      and meta["license"] == "MIT", meta)
+
+# session-start hook
+r = run("session-start")
+try:
+    out = json.loads(r.stdout)["hookSpecificOutput"]
+    policy = open(os.path.join(ROOT, "policy.md")).read()
+    check("session-start emits policy as hook JSON",
+          r.returncode == 0 and out["hookEventName"] == "SessionStart" and out["additionalContext"] == policy
+          and "lachesis:scout" in policy)
+except Exception as e:
+    check("session-start emits policy as hook JSON", False, (e, r.stdout, r.stderr))
+
+# status line
+sample = {"model": {"display_name": "Opus"}, "effort": {"level": "medium"},
+          "context_window": {"current_usage": {"input_tokens": 10, "cache_read_input_tokens": 260000,
+                                               "cache_creation_input_tokens": 0}},
+          "cost": {"total_cost_usd": 1.234}, "rate_limits": {"five_hour": {"used_percentage": 42.4},
+                                                              "seven_day": {"used_percentage": 95}}}
+r = run("lachesis-statusline", inp=json.dumps(sample))
+check("statusline renders sample", r.returncode == 0 and "Opus" in r.stdout and "ctx 260k" in r.stdout
+      and "$1.23" in r.stdout and "5h 42%" in r.stdout and "7d 95%" in r.stdout, r)
+r = run("lachesis-statusline", inp="{}")
+check("statusline handles empty object", r.returncode == 0 and r.stdout.strip() != "", r)
+r = run("lachesis-statusline", inp="not json")
+check("statusline handles garbage", r.returncode == 0, r)
+r = run("lachesis-statusline", "--setup")
+try:
+    cmd = json.loads(r.stdout[:r.stdout.rindex("}") + 1])["statusLine"]["command"]
+    check("statusline --setup prints real path", os.path.isfile(cmd) and os.access(cmd, os.X_OK), cmd)
+except Exception as e:
+    check("statusline --setup prints real path", False, (e, r.stdout))
+
+# audit on a fixture transcript
+proj = os.path.join(tmp, "projects", "-fixture")
+os.makedirs(proj)
+rows = []
+for i in range(2):
+    rows.append({"type": "assistant", "timestamp": "2026-01-01T00:00:0%dZ" % i, "message": {
+        "id": "m%d" % i, "model": "claude-sonnet-5-5", "content": [{"type": "text", "text": "hi"}],
+        "usage": {"input_tokens": 1000000, "output_tokens": 1000000, "cache_read_input_tokens": 0,
+                  "cache_creation_input_tokens": 0}}})
+rows.insert(0, {"type": "user", "timestamp": "2026-01-01T00:00:00Z", "message": {"role": "user", "content": "hello"}})
+with open(os.path.join(proj, "s.jsonl"), "w") as f:
+    f.write("\n".join(json.dumps(x) for x in rows) + "\n")
+env = {"CLAUDE_CONFIG_DIR": tmp}
+r = run("lachesis-audit", "--json", env=env)
+try:
+    rep = json.loads(r.stdout)
+    # 2 calls x (1M in x $2 + 1M out x $10) = $24
+    check("audit prices fixture", rep["calls"] == 2 and abs(rep["total_cost"] - 24.0) < 0.01, rep.get("total_cost"))
+except Exception as e:
+    check("audit prices fixture", False, (e, r.stdout[:200], r.stderr[-200:]))
+r = run("lachesis-audit", env=env)
+check("audit text report", r.returncode == 0 and "Lachesis audit" in r.stdout and "$24.00" in r.stdout, r.stderr)
+r = run("lachesis-audit", "--help")
+check("audit --help", r.returncode == 0 and "--days" in r.stdout, r.stderr)
+r = run("lachesis-audit", env={"CLAUDE_CONFIG_DIR": os.path.join(tmp, "empty")})
+check("audit with no transcripts exits cleanly", "no calls found" in r.stderr and "Traceback" not in r.stderr, r)
+
+# no personal data anywhere (except plugin.json author)
+bad = []
+for d, dirs, files in os.walk(ROOT):
+    dirs[:] = [x for x in dirs if x != "__pycache__"]
+    for fn in files:
+        p = os.path.join(d, fn)
+        if os.path.abspath(p) == os.path.abspath(__file__):
+            continue
+        text = open(p, errors="replace").read()
+        if p.endswith("plugin.json"):
+            text = text.replace('"badussy"', "")
+        if re.search(r"/home/|badussy", text):
+            bad.append(os.path.relpath(p, ROOT))
+check("no /home/ or badussy outside plugin.json author", not bad, bad)
+check("no __pycache__", not any("__pycache__" in d for d, _, _ in os.walk(ROOT)))
+
+sys.exit(1 if fails else 0)
