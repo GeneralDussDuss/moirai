@@ -445,7 +445,7 @@ $("#model-pages").innerHTML = P.map(p=>`<section class="page" id="p-${p.id}" sty
     <div class="seals">${p.meta.map(m=>`<span><b>${m[0]}</b>${m[1]}</span>`).join("")}</div></div>
 </section>`).join("");
 
-const CMDS = ["/plugin marketplace add badussy/moirai", ...P.map(p=>`/plugin install ${p.id}@moirai`)];
+const CMDS = ["/plugin marketplace add GeneralDussDuss/moirai", ...P.map(p=>`/plugin install ${p.id}@moirai`)];
 $("#cmds").innerHTML = CMDS.map((c,i)=>`<div class="cmd"><code id="cmd${i}">${c}</code><button type="button" data-copy="${i}">COPY</button></div>`).join("");
 document.addEventListener("click", e=>{
   const b = e.target.closest("[data-copy]"); if(!b) return;

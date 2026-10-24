@@ -24,7 +24,7 @@ helpers it routes to, and measures the result.
 ## Install
 
 ```
-/plugin marketplace add <owner>/moirai
+/plugin marketplace add GeneralDussDuss/moirai
 /plugin install lachesis@moirai
 ```
 
