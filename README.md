@@ -12,7 +12,7 @@ A plugin pack for [Claude Code](https://claude.com/claude-code) that takes charg
 > - it missed something it should have caught
 > - anything confusing, slow, noisy or broken
 >
-> [Open an issue](https://github.com/GeneralDussDuss/moirai/issues/new/choose) with what you ran and what the plugin said. Ideas for new plugins are just as welcome.
+> The [testing guide](TESTING.md) has drills for pushing each plugin safely and a checklist for a good report. Then [open an issue](https://github.com/GeneralDussDuss/moirai/issues/new/choose) with what you ran and what the plugin said. Ideas for new plugins are just as welcome.
 
 | Plugin | Myth | What it does |
 |---|---|---|
