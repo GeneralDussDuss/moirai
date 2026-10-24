@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Argus audit: list every claim in a transcript with its evidence status.
+"""Aletheia audit: list every claim in a transcript with its evidence status.
 
-Usage: argus-audit [TRANSCRIPT.jsonl] [--last N] [--all] [--days N] [--json] [--quiet]
+Usage: aletheia-audit [TRANSCRIPT.jsonl] [--last N] [--all] [--days N] [--json] [--quiet]
 
   no path   newest transcript of the current directory's project
   --all     scan every transcript under ~/.claude/projects (newest first)
@@ -18,7 +18,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-import argus_core as core
+import aletheia_core as core
 
 PROJECTS = os.path.expanduser("~/.claude/projects")
 BAD = ("missing", "stale", "failed")
@@ -68,7 +68,7 @@ def main(argv):
     elif not paths:
         p = default_transcript()
         if not p:
-            print("argus: no transcript found")
+            print("aletheia: no transcript found")
             return 1
         paths = [p]
     rows, nturns = [], 0
@@ -76,7 +76,7 @@ def main(argv):
         try:
             r, n = scan(p, cfg, last)
         except Exception as e:
-            print("argus: skipped %s (%r)" % (p, e), file=sys.stderr)
+            print("aletheia: skipped %s (%r)" % (p, e), file=sys.stderr)
             continue
         rows += r
         nturns += n
@@ -86,7 +86,7 @@ def main(argv):
     counts = {}
     for r in rows:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
-    print("argus: %d transcript(s), %d turn(s), %d claim(s): %s" % (
+    print("aletheia: %d transcript(s), %d turn(s), %d claim(s): %s" % (
         len(paths), nturns, len(rows), ", ".join("%d %s" % (v, k.upper()) for k, v in sorted(counts.items())) or "none"))
     for r in rows:
         if allp and r["status"] not in BAD:

@@ -1,12 +1,12 @@
 {
-  "description": "Argus: check Claude's final claims against what actually ran this turn",
+  "description": "Aletheia: check Claude's final claims against what actually ran this turn",
   "hooks": {
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/argus-stop\"",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/aletheia-stop\"",
             "timeout": 10
           }
         ]

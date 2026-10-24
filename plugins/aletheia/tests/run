@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Argus tests: feed fixture transcripts + Stop hook JSON to bin/argus-stop and
+"""Aletheia tests: feed fixture transcripts + Stop hook JSON to bin/aletheia-stop and
 assert block/allow. Runs with an isolated HOME. Exit 1 on any failure."""
 import json
 import os
@@ -8,7 +8,7 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-HOOK = os.path.join(ROOT, "bin", "argus-stop")
+HOOK = os.path.join(ROOT, "bin", "aletheia-stop")
 sys.path.insert(0, os.path.join(ROOT, "bin"))
 
 _n = [0]
@@ -58,8 +58,8 @@ def run_hook(entries, stop_hook_active=False, config=None, extra_prior=None):
             for e in entries:
                 f.write(json.dumps(e) + "\n")
         if config is not None:
-            os.makedirs(os.path.join(home, ".config", "argus"))
-            with open(os.path.join(home, ".config", "argus", "config.json"), "w") as f:
+            os.makedirs(os.path.join(home, ".config", "aletheia"))
+            with open(os.path.join(home, ".config", "aletheia", "config.json"), "w") as f:
                 json.dump(config, f)
         payload = {"session_id": "s1", "transcript_path": tp, "cwd": "/p", "hook_event_name": "Stop",
                    "stop_hook_active": stop_hook_active}
@@ -134,7 +134,7 @@ case("evidence from previous turn does not count", flat(P, edit(), bash("pytest"
 case("tool_result user entry is not a prompt", flat(P, bash("pytest"), say("All tests pass.")), None)
 case("meta user entries are not prompts", flat(P, bash("pytest"), {"type": "user", "isMeta": True, "message": {"role": "user", "content": "caveat"}}, say("All tests pass.")), None)
 case("stop_hook_active -> never block", flat(P, edit(), say("All tests pass.")), None, stop_hook_active=True)
-case("stop hook feedback is not a prompt", flat(P, bash("pytest"), say("hm"), user("Stop hook feedback: Argus: nope"), say("All tests pass.")), None)
+case("stop hook feedback is not a prompt", flat(P, bash("pytest"), say("hm"), user("Stop hook feedback: Aletheia: nope"), say("All tests pass.")), None)
 # -- config
 case("disabled", flat(P, edit(), say("All tests pass.")), None, config={"enabled": False})
 case("check off", flat(P, edit(), say("All tests pass.")), None, config={"checks": {"tests": False}})
@@ -163,8 +163,8 @@ def extra():
         with open(tp, "w") as fh:
             for e in flat(P, edit(), say("All tests pass.")):
                 fh.write(json.dumps(e) + "\n")
-        os.makedirs(os.path.join(home, ".config", "argus"))
-        with open(os.path.join(home, ".config", "argus", "config.json"), "w") as fh:
+        os.makedirs(os.path.join(home, ".config", "aletheia"))
+        with open(os.path.join(home, ".config", "aletheia", "config.json"), "w") as fh:
             json.dump({"max_blocks_per_session": 1}, fh)
         outs = []
         for _ in range(2):
@@ -175,7 +175,7 @@ def extra():
             fails.append("max_blocks_per_session cap: %r" % outs)
     # block output shape
     out = run_hook(flat(P, edit(), say("All tests pass.")))
-    if not (out and out.get("decision") == "block" and out["reason"].startswith("Argus:") and "unverified" in out["reason"]):
+    if not (out and out.get("decision") == "block" and out["reason"].startswith("Aletheia:") and "unverified" in out["reason"]):
         fails.append("block output shape: %r" % out)
     return fails
 

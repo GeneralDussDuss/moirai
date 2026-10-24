@@ -8,7 +8,7 @@ A plugin pack for [Claude Code](https://claude.com/claude-code) that takes charg
 |---|---|---|
 | **[Clotho](plugins/clotho)** | spins the thread | Every session starts knowing where the work stands. A small per-project thread survives `/clear` and compaction, with automatic breadcrumbs and a `/clotho:wrap` handoff. |
 | **[Atropos](plugins/atropos)** | cuts the thread | Stops runaway sessions: identical-call loops, the same failing command over and over, subagent overspawn, context bloat, and an optional spend cap. |
-| **[Argus](plugins/argus)** | the hundred-eyed watchman | Checks claims against the transcript. No "all tests pass" without a test run after the last edit, no "pushed" without a push. |
+| **[Aletheia](plugins/aletheia)** | the spirit of truth | Checks claims against the transcript. No "all tests pass" without a test run after the last edit, no "pushed" without a push. |
 | **[Cerberus](plugins/cerberus)** | guards the gate | Guards what the agent *does*: secrets leaving the machine, destructive commands, and prompt injection in fetched content. A tripwire, not a sandbox. |
 
 ## Install
@@ -17,7 +17,7 @@ A plugin pack for [Claude Code](https://claude.com/claude-code) that takes charg
 /plugin marketplace add badussy/moirai
 /plugin install clotho@moirai
 /plugin install atropos@moirai
-/plugin install argus@moirai
+/plugin install aletheia@moirai
 /plugin install cerberus@moirai
 ```
 

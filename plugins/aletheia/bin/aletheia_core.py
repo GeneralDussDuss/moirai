@@ -1,7 +1,7 @@
-"""Argus core: parse a Claude Code transcript into turns, find claims in the
+"""Aletheia core: parse a Claude Code transcript into turns, find claims in the
 final assistant text, and check each against the tool calls of that turn.
 
-Stdlib only. Imported by argus-stop (hook) and argus-audit (CLI).
+Stdlib only. Imported by aletheia-stop (hook) and aletheia-audit (CLI).
 """
 import json
 import os
@@ -10,8 +10,8 @@ import shlex
 import time
 
 HOME = os.path.expanduser("~")
-CONFIG_PATH = os.path.join(HOME, ".config", "argus", "config.json")
-STATE_DIR = os.path.join(HOME, ".local", "state", "argus")
+CONFIG_PATH = os.path.join(HOME, ".config", "aletheia", "config.json")
+STATE_DIR = os.path.join(HOME, ".local", "state", "aletheia")
 
 DEFAULT_CONFIG = {
     "enabled": True,
@@ -44,7 +44,7 @@ def log(msg, cfg=None):
         if cfg is not None and not cfg.get("log", True):
             return
         os.makedirs(STATE_DIR, exist_ok=True)
-        p = os.path.join(STATE_DIR, "argus.log")
+        p = os.path.join(STATE_DIR, "aletheia.log")
         if os.path.exists(p) and os.path.getsize(p) > 200_000:
             os.replace(p, p + ".1")
         with open(p, "a") as f:
@@ -593,4 +593,4 @@ def build_reason(findings):
     parts = []
     for f in findings[:3]:
         parts.append('you said "%s" but %s' % (f["snippet"][:90].strip(), f["detail"]))
-    return "Argus: " + "; and ".join(parts) + ". Run it now, or say plainly that it is unverified."
+    return "Aletheia: " + "; and ".join(parts) + ". Run it now, or say plainly that it is unverified."

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Argus Stop hook: block the stop when the final reply claims something
+"""Aletheia Stop hook: block the stop when the final reply claims something
 (tests pass, builds clean, committed, fixed) that this turn's tool calls do not
 back up. Any internal error exits 0 silently."""
 import json
@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 
 def main():
-    import argus_core as core
+    import aletheia_core as core
     cfg = core.load_config()
     try:
         data = json.load(sys.stdin)
@@ -74,8 +74,8 @@ if __name__ == "__main__":
         main()
     except Exception as e:  # never crash the session
         try:
-            import argus_core
-            argus_core.log("error: %r" % (e,))
+            import aletheia_core
+            aletheia_core.log("error: %r" % (e,))
         except Exception:
             pass
     sys.exit(0)
