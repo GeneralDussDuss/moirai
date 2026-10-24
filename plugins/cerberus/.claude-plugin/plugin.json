@@ -1,0 +1,7 @@
+{
+  "name": "cerberus",
+  "version": "0.1.0",
+  "description": "Guards what the agent does: blocks secrets leaving in commands and URLs, asks before destructive commands, and flags prompt injection in fetched content.",
+  "author": { "name": "badussy" },
+  "license": "MIT"
+}

@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Clotho tests: stdlib only. Runs bin/clotho against fixtures in a temp dir."""
+import json, os, subprocess, sys, tempfile, time, unittest, warnings
+warnings.simplefilter("ignore")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BIN = os.path.join(HERE, "..", "bin", "clotho")
+FIX = os.path.join(HERE, "fixtures")
+
+
+class T(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.proj = os.path.join(self.tmp, "proj")
+        os.makedirs(self.proj)
+        subprocess.run(["git", "-C", self.proj, "init", "-q"], check=True)
+        open(os.path.join(self.proj, "dirty.txt"), "w").write("x")
+        self.state = os.path.join(self.tmp, "state")
+        self.env = dict(os.environ, CLOTHO_STATE_DIR=self.state,
+                        CLOTHO_CONFIG=os.path.join(self.tmp, "none.json"))
+        self.thread = os.path.join(self.proj, ".claude", "thread.md")
+
+    def run_cmd(self, *args, stdin="", cwd=None, env=None):
+        return subprocess.run([BIN, *args], input=stdin, capture_output=True, text=True,
+                              cwd=cwd or self.proj, env=env or self.env)
+
+    def hook(self, event, **extra):
+        d = dict(session_id="s1", cwd=self.proj, hook_event_name=event,
+                 transcript_path=os.path.join(FIX, "transcript.jsonl"), **extra)
+        return self.run_cmd("breadcrumb" if event != "SessionStart" else "start", stdin=json.dumps(d))
+
+    def test_breadcrumb_creates_and_replaces(self):
+        r = self.hook("PreCompact", trigger="auto")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        t = open(self.thread).read()
+        self.assertIn("Where it stopped", t)
+        self.assertIn("app/main.py", t)
+        self.assertIn("notes.md", t)
+        self.assertIn("pytest -x", t)               # failed command
+        self.assertNotIn("echo ok", t)              # successful one is not listed
+        self.assertIn("make the parser faster", t)  # last two user requests
+        self.assertIn("now add tests", t)
+        self.assertNotIn("first request", t)
+        self.assertIn("dirty.txt", t)
+        self.hook("SessionEnd", reason="clear")
+        t2 = open(self.thread).read()
+        self.assertEqual(t2.count("clotho:breadcrumb -->"), 2)  # one open + one close marker line pair
+        self.assertEqual(t2.count("Where it stopped"), 1)
+
+    def test_breadcrumb_preserves_model_sections(self):
+        os.makedirs(os.path.dirname(self.thread))
+        open(self.thread, "w").write("# Thread\n\n## Goal\nShip the parser.\n\n## Next\n- run tests\n")
+        self.hook("SessionEnd", reason="exit")
+        t = open(self.thread).read()
+        self.assertIn("Ship the parser.", t)
+        self.assertIn("Where it stopped", t)
+
+    def test_no_litter_for_trivial_session(self):
+        d = dict(cwd=self.proj, transcript_path=os.path.join(FIX, "trivial.jsonl"))
+        self.run_cmd("breadcrumb", stdin=json.dumps(d))
+        self.assertFalse(os.path.exists(self.thread))
+
+    def test_bad_input_never_fails(self):
+        for stdin in ["", "not json", "[]", json.dumps({"cwd": "/nonexistent/x", "transcript_path": "/nope"})]:
+            for c in ("start", "breadcrumb"):
+                r = self.run_cmd(c, stdin=stdin)
+                self.assertEqual(r.returncode, 0, (c, stdin, r.stderr))
+        r = self.run_cmd("start", stdin="{}", env=dict(self.env, CLOTHO_STATE_DIR="/proc/nope"))
+        self.assertEqual(r.returncode, 0)
+
+    def test_start_injects(self):
+        os.makedirs(os.path.dirname(self.thread))
+        open(self.thread, "w").write("# Thread\n\n## Goal\nShip the parser.\n\n## Done\n\n## Next\n- run tests\n")
+        r = self.hook("SessionStart", source="clear")
+        out = json.loads(r.stdout)["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "SessionStart")
+        c = out["additionalContext"]
+        self.assertIn("Thread from", c)
+        self.assertIn("Ship the parser.", c)
+        self.assertNotIn("## Done", c)  # empty sections are dropped
+
+    def test_start_silent_without_thread(self):
+        r = self.hook("SessionStart", source="startup")
+        self.assertEqual((r.returncode, r.stdout), (0, ""))
+
+    def test_stale_is_one_line(self):
+        os.makedirs(os.path.dirname(self.thread))
+        open(self.thread, "w").write("# Thread\n\n## Goal\nSECRET-BODY\n")
+        old = time.time() - 20 * 86400
+        os.utime(self.thread, (old, old))
+        c = json.loads(self.hook("SessionStart", source="startup").stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("SECRET-BODY", c)
+        self.assertEqual(len(c.splitlines()), 1)
+        self.assertIn("20 days", c)
+
+    def test_stale_days_configurable(self):
+        cfg = os.path.join(self.tmp, "c.json")
+        json.dump({"stale_days": 30}, open(cfg, "w"))
+        env = dict(self.env, CLOTHO_CONFIG=cfg)
+        os.makedirs(os.path.dirname(self.thread))
+        open(self.thread, "w").write("# Thread\n\n## Goal\nBODY-HERE\n")
+        old = time.time() - 20 * 86400
+        os.utime(self.thread, (old, old))
+        r = self.run_cmd("start", stdin=json.dumps({"cwd": self.proj}), env=env)
+        self.assertIn("BODY-HERE", r.stdout)
+
+    def test_inject_budget_keeps_priority(self):
+        os.makedirs(os.path.dirname(self.thread))
+        done = "\n".join(f"- done item {i} " + "x" * 80 for i in range(200))
+        open(self.thread, "w").write(f"# Thread\n\n## Goal\nKEEP-GOAL\n\n## Done\n{done}\n\n## Next\n- KEEP-NEXT\n")
+        c = json.loads(self.hook("SessionStart", source="compact").stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertLess(len(c), 1500 * 4 + 400)
+        self.assertIn("KEEP-GOAL", c)
+        self.assertIn("KEEP-NEXT", c)
+
+    def test_cap_rolls_done_to_log(self):
+        os.makedirs(os.path.dirname(self.thread))
+        done = "\n".join(f"- old item {i}" for i in range(80))
+        open(self.thread, "w").write(f"# Thread\n\n## Goal\nG\n\n## Done\n{done}\n\n## Next\n- N\n")
+        self.hook("SessionEnd", reason="exit")
+        t = open(self.thread).read()
+        self.assertLessEqual(len(t.splitlines()), 60)
+        self.assertIn("- N", t)
+        self.assertIn("Where it stopped", t)
+        self.assertNotIn("- old item 0\n", t)
+        log = open(os.path.join(self.proj, ".claude", "thread.log.md")).read()
+        self.assertIn("- old item 0", log)
+
+    def test_state_location(self):
+        cfg = os.path.join(self.tmp, "c.json")
+        json.dump({"location": "state"}, open(cfg, "w"))
+        env = dict(self.env, CLOTHO_CONFIG=cfg)
+        d = dict(cwd=self.proj, transcript_path=os.path.join(FIX, "transcript.jsonl"))
+        self.run_cmd("breadcrumb", stdin=json.dumps(d), env=env)
+        self.assertFalse(os.path.exists(self.thread))
+        self.assertTrue([f for f in os.listdir(self.state) if f.startswith("proj-") and f.endswith(".md")])
+
+    def test_path_subcommand(self):
+        r = self.run_cmd("path")
+        self.assertEqual(r.stdout.strip(), self.thread)
+
+    def test_hooks_json_valid(self):
+        h = json.load(open(os.path.join(HERE, "..", "hooks", "hooks.json")))["hooks"]
+        self.assertEqual(set(h), {"SessionStart", "PreCompact", "SessionEnd"})
+        json.load(open(os.path.join(HERE, "..", ".claude-plugin", "plugin.json")))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

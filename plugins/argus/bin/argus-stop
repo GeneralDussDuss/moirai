@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Argus Stop hook: block the stop when the final reply claims something
+(tests pass, builds clean, committed, fixed) that this turn's tool calls do not
+back up. Any internal error exits 0 silently."""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+
+def main():
+    import argus_core as core
+    cfg = core.load_config()
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        return
+    if not cfg.get("enabled", True) or data.get("stop_hook_active"):
+        return                                   # never block twice in a row
+    cwd = data.get("cwd") or ""
+    if any(s and s in cwd for s in cfg.get("ignore_projects", [])):
+        return
+    path = data.get("transcript_path")
+    if not path or not os.path.exists(path):
+        return
+    sid = data.get("session_id") or "unknown"
+
+    # Read only the tail; widen until a real user prompt (the turn start) is in view.
+    turn, size = None, 1 << 20
+    while True:
+        turns = core.split_turns(core.read_entries(path, tail_bytes=size))
+        if turns:
+            turn = turns[-1]
+            break
+        if os.path.getsize(path) <= size:
+            break
+        size *= 4
+    if not turn:
+        return
+    text = data.get("last_assistant_message") if isinstance(data.get("last_assistant_message"), str) else None
+    # The transcript's final text is authoritative for "after the last tool call".
+    findings = [f for f in core.check_turn(turn, cfg, text=text or None)
+                if f["status"] in ("missing", "stale", "failed")]
+    if not findings:
+        return
+
+    state_p = os.path.join(core.STATE_DIR, "blocks.json")
+    try:
+        with open(state_p) as f:
+            state = json.load(f)
+    except Exception:
+        state = {}
+    n = state.get(sid, 0)
+    if n >= int(cfg.get("max_blocks_per_session", 5)):
+        core.log("session %s over max_blocks; allowing" % sid, cfg)
+        return
+    reason = core.build_reason(findings)
+    try:
+        os.makedirs(core.STATE_DIR, exist_ok=True)
+        state[sid] = n + 1
+        if len(state) > 200:
+            state = dict(list(state.items())[-100:])
+        with open(state_p, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+    core.log("BLOCK %s :: %s" % (sid, reason), cfg)
+    sys.stdout.write(json.dumps({"decision": "block", "reason": reason}))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # never crash the session
+        try:
+            import argus_core
+            argus_core.log("error: %r" % (e,))
+        except Exception:
+            pass
+    sys.exit(0)

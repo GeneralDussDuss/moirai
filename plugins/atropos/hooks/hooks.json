@@ -1,0 +1,17 @@
+{
+  "description": "Atropos: cut loops, subagent overspawn, context bloat and blown budgets",
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/atropos\" hook", "timeout": 5 } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/atropos\" hook", "timeout": 5 } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/atropos\" hook", "timeout": 5 } ] }
+    ],
+    "PostToolUseFailure": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/atropos\" hook", "timeout": 5 } ] }
+    ]
+  }
+}

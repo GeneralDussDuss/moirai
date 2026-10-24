@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Atropos tests: pipe fixture hook JSON into bin/atropos and assert on output."""
+import json, os, subprocess, sys, tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BIN = os.path.join(HERE, "..", "bin", "atropos")
+tmp = tempfile.mkdtemp()
+ENV = dict(os.environ, ATROPOS_STATE_DIR=os.path.join(tmp, "state"), ATROPOS_CONFIG=os.path.join(tmp, "cfg.json"))
+fails = 0
+
+def hook(payload):
+    r = subprocess.run([BIN, "hook"], input=payload if isinstance(payload, str) else json.dumps(payload),
+                       capture_output=True, text=True, env=ENV)
+    assert r.returncode == 0, "exit %d: %s" % (r.returncode, r.stderr)
+    return json.loads(r.stdout)["hookSpecificOutput"] if r.stdout.strip() else None
+
+def cli(*a):
+    return subprocess.run([BIN, *a], capture_output=True, text=True, env=ENV).stdout
+
+def check(name, cond, extra=""):
+    global fails
+    print(("ok   " if cond else "FAIL ") + name + ("" if cond else "  " + str(extra)))
+    fails += not cond
+
+def pre(sid, tool, tin, tp=None):
+    p = {"session_id": sid, "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": tin, "cwd": "/"}
+    if tp: p["transcript_path"] = tp
+    return hook(p)
+
+def post(sid, tool, tin, failed):
+    return hook({"session_id": sid, "hook_event_name": "PostToolUseFailure" if failed else "PostToolUse",
+                 "tool_name": tool, "tool_input": tin})
+
+def transcript(name, rows):
+    p = os.path.join(tmp, name + ".jsonl")
+    with open(p, "w") as f:
+        for i, (model, inp, cr, cw, out) in enumerate(rows):
+            f.write(json.dumps({"type": "assistant", "uuid": "u%d" % i, "message": {
+                "id": "m%d" % i, "model": model, "usage": {
+                    "input_tokens": inp, "cache_read_input_tokens": cr,
+                    "cache_creation_input_tokens": cw, "output_tokens": out}}}) + "\n")
+    return p
+
+# loop cut
+r = [pre("loop", "Read", {"file_path": "/a"}) for _ in range(5)]
+check("loop: 1st/2nd silent", r[0] is None and r[1] is None, r[:2])
+check("loop: 3rd warns", r[2] and "additionalContext" in r[2] and "permissionDecision" not in r[2], r[2])
+check("loop: 5th denied", r[4] and r[4]["permissionDecision"] == "deny" and "approach" in r[4]["permissionDecisionReason"], r[4])
+check("loop: different input not affected", pre("loop", "Read", {"file_path": "/b"}) is None)
+check("loop: ignored tool never counted", all(pre("loop", "TodoWrite", {"x": 1}) is None for _ in range(8)))
+
+# bash failures
+cmd = {"command": "make"}
+check("bash: 1st attempt allowed", pre("bf", "Bash", cmd) is None)
+post("bf", "Bash", cmd, True)
+check("bash: 2nd attempt allowed", pre("bf", "Bash", cmd) is None)
+o = post("bf", "Bash", cmd, True)
+check("bash: 2nd failure injects advice", o and "failed 2 times" in o["additionalContext"], o)
+d = pre("bf", "Bash", cmd)
+check("bash: 3rd attempt denied", d and d["permissionDecision"] == "deny", d)
+check("bash: other command fine", pre("bf", "Bash", {"command": "ls"}) is None)
+c2 = {"command": "flaky"}
+post("bf", "Bash", c2, True); post("bf", "Bash", c2, False); post("bf", "Bash", c2, True)
+check("bash: success clears failures", pre("bf", "Bash", c2) is None)
+
+# subagents
+res = [pre("ag", "Agent", {"prompt": "t%d" % i}) for i in range(9)]
+check("agents: silent through 4", all(x is None for x in res[:4]), res[:4])
+check("agents: 5th warns", res[4] and "additionalContext" in res[4])
+check("agents: 6-8 quiet", all(x is None for x in res[5:8]), res[5:8])
+check("agents: 9th asks", res[8] and res[8]["permissionDecision"] == "ask", res[8])
+hook({"session_id": "ag", "hook_event_name": "UserPromptSubmit", "prompt": "hi"})
+check("agents: new user turn resets", pre("ag", "Agent", {"prompt": "z"}) is None)
+
+# context
+tp = transcript("ctx", [("claude-opus-5-5", 2, 150000, 60000, 100)])
+o = pre("cx", "Read", {"file_path": "/x"}, tp)
+check("context: 210k warns once", o and "210k" in o["additionalContext"], o)
+check("context: not repeated", pre("cx", "Read", {"file_path": "/y"}, tp) is None)
+tp2 = transcript("ctx2", [("claude-opus-5-5", 2, 150000, 60000, 100), ("claude-opus-5-5", 2, 400000, 20000, 5)])
+o = pre("cx", "Read", {"file_path": "/z"}, tp2)
+check("context: 400k threshold warns", o and "420k" in o["additionalContext"], o)
+check("context: below threshold silent", pre("cx2", "Read", {"file_path": "/q"}, transcript("small", [("claude-haiku-5-5", 1, 5000, 0, 10)])) is None)
+
+# budget
+json.dump({"budget_cap_usd": 1.0}, open(ENV["ATROPOS_CONFIG"], "w"))
+tp3 = transcript("cost", [("claude-opus-5-5", 0, 0, 0, 100000)])  # 100k out at $20/M = $2.00
+o = pre("bu", "Bash", {"command": "ls"}, tp3)
+check("budget: over cap asks with amount", o and o["permissionDecision"] == "ask" and "$2.00" in o["permissionDecisionReason"], o)
+check("budget: not nagging right after", pre("bu", "Bash", {"command": "pwd"}, tp3) is None)
+tp4 = transcript("cheap", [("claude-haiku-5-5", 0, 0, 0, 100000)])  # $0.05
+check("budget: under cap silent", pre("bu2", "Bash", {"command": "ls"}, tp4) is None)
+check("status shows cost", "$2.00" in cli("status", "--session", "bu") and "cap $1.00" in cli("status", "--session", "bu"))
+cli("spare", "--session", "bu", "--cap", "off")
+check("spare: cap off", "cap off" in cli("status", "--session", "bu"))
+cli("spare", "--session", "loop")
+check("spare: loop counters reset", pre("loop", "Read", {"file_path": "/a"}) is None)
+os.remove(ENV["ATROPOS_CONFIG"])
+
+# robustness
+check("garbage stdin exits 0 silently", hook("not json{{") is None)
+check("empty stdin exits 0 silently", hook("") is None)
+check("missing fields exit 0", hook({"hook_event_name": "PreToolUse"}) is None)
+json.dump({"enabled": False}, open(ENV["ATROPOS_CONFIG"], "w"))
+check("disabled: no output", all(pre("off", "Read", {"a": 1}) is None for _ in range(6)))
+
+print("\n%s" % ("all passed" if not fails else "%d FAILED" % fails))
+sys.exit(1 if fails else 0)

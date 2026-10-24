@@ -1,0 +1,29 @@
+{
+  "description": "Cerberus: egress and ruin checks before tools run, siren scan of fetched content after",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|WebFetch|WebSearch|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/cerberus-pre\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|WebFetch|WebSearch|Read|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/cerberus-post\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "argus",
+  "version": "0.1.0",
+  "description": "Hundred eyes on Claude's claims: blocks 'tests pass', 'builds clean', 'committed' and 'fixed' when this turn has no matching evidence, and audits any transcript for unsupported claims.",
+  "author": { "name": "badussy" },
+  "license": "MIT"
+}

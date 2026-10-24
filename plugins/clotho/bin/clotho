@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""Clotho: the thread that survives /clear and compaction.
+
+  clotho start        SessionStart hook: inject the thread as additionalContext
+  clotho breadcrumb   PreCompact / SessionEnd hook: refresh the auto breadcrumb
+  clotho path         print the thread file path for the current project
+  clotho enforce      keep the thread under its size cap (Done rolls to the log)
+  clotho show         print the thread
+
+Hooks read JSON on stdin and never fail the session: any error is logged to
+~/.local/state/clotho/clotho.log and the process exits 0.
+Env overrides (for tests): CLOTHO_CONFIG, CLOTHO_STATE_DIR.
+"""
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+STATE = os.environ.get("CLOTHO_STATE_DIR") or os.path.join(HOME, ".local/state/clotho")
+CONFIG = os.environ.get("CLOTHO_CONFIG") or os.path.join(HOME, ".config/clotho/config.json")
+DEFAULTS = {
+    "location": "project",      # "project": <root>/.claude/thread.md ; "state": ~/.local/state/clotho/<slug>.md
+    "stale_days": 14,
+    "max_lines": 60,            # hard cap on the thread file
+    "inject_max_tokens": 1500,  # ~4 chars per token
+    "enabled": True,
+}
+SECTIONS = ["Goal", "Done", "In progress", "Next", "Decisions", "Gotchas", "Open questions"]
+BC_OPEN, BC_CLOSE = "<!-- clotho:breadcrumb -->", "<!-- /clotho:breadcrumb -->"
+BC_RE = re.compile(re.escape(BC_OPEN) + r".*?" + re.escape(BC_CLOSE) + r"\n?", re.S)
+TAIL_BYTES = 8_000_000
+
+
+def log(msg):
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(os.path.join(STATE, "clotho.log"), "a") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
+    except Exception:
+        pass
+
+
+def config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as f:
+            user = json.load(f)
+        if isinstance(user, dict):
+            cfg.update({k: v for k, v in user.items() if k in DEFAULTS})
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"bad config: {e}")
+    return cfg
+
+
+def project_root(cwd):
+    cwd = os.path.abspath(cwd or os.getcwd())
+    try:
+        out = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=3)
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return cwd
+
+
+def thread_path(root, cfg):
+    # Never write into $HOME itself: it is not a project.
+    if cfg["location"] == "state" or os.path.realpath(root) == os.path.realpath(HOME):
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", os.path.basename(root.rstrip("/")) or "root")
+        h = hashlib.sha1(root.encode()).hexdigest()[:8]
+        return os.path.join(STATE, f"{slug}-{h}.md")
+    return os.path.join(root, ".claude", "thread.md")
+
+
+def log_path(tp):
+    return tp[:-3] + ".log.md" if tp.endswith(".md") else tp + ".log.md"
+
+
+def read(p):
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def write_atomic(p, text):
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = f"{p}.tmp{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, p)
+
+
+def hook_input():
+    try:
+        raw = sys.stdin.read()
+        d = json.loads(raw) if raw.strip() else {}
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+# ---------- transcript -> breadcrumb ----------
+
+def trunc(s, n):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def user_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return ""
+        return "\n".join(b.get("text", "") for b in content
+                         if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def read_transcript(path):
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > TAIL_BYTES:
+                f.seek(size - TAIL_BYTES)
+                f.readline()
+            data = f.read().decode("utf-8", "replace")
+    except Exception:
+        return []
+    out = []
+    for line in data.splitlines():
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            pass
+    return out
+
+
+def analyse(path, root):
+    edits, prompts, fails, cmds = [], [], [], {}
+    for d in read_transcript(path):
+        if d.get("isSidechain"):
+            continue
+        m = d.get("message")
+        if not isinstance(m, dict):
+            continue
+        t = d.get("type")
+        if t == "assistant" and isinstance(m.get("content"), list):
+            for b in m["content"]:
+                if not isinstance(b, dict) or b.get("type") != "tool_use":
+                    continue
+                inp = b.get("input") or {}
+                if b.get("name") in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+                    fp = inp.get("file_path") or inp.get("notebook_path")
+                    if fp:
+                        edits.append(fp)
+                elif b.get("name") == "Bash" and inp.get("command"):
+                    cmds[b.get("id")] = inp["command"]
+        elif t == "user" and not d.get("isMeta"):
+            c = m.get("content")
+            if isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error") \
+                            and b.get("tool_use_id") in cmds:
+                        fails.append(cmds[b["tool_use_id"]])
+            txt = user_text(c).strip()
+            if txt and not txt.startswith("<"):
+                prompts.append(txt)
+    seen, files = set(), []
+    for fp in reversed(edits):  # most recent first, deduped
+        if fp not in seen:
+            seen.add(fp)
+            files.append(rel(fp, root))
+    return files, fails, prompts
+
+
+def rel(fp, root):
+    try:
+        r = os.path.relpath(fp, root)
+        return fp if r.startswith("..") else r
+    except Exception:
+        return fp
+
+
+def git_changes(root):
+    try:
+        out = subprocess.run(["git", "-C", root, "status", "--porcelain"],
+                             capture_output=True, text=True, timeout=3)
+        if out.returncode != 0:
+            return None
+        return [l for l in out.stdout.splitlines() if l.strip()]
+    except Exception:
+        return None
+
+
+def build_breadcrumb(files, fails, prompts, git, session_id=""):
+    now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    L = [BC_OPEN, f"## Where it stopped (auto, {now})"]
+    L.append("- Files edited: " + (", ".join(files[:8]) + (f" (+{len(files) - 8} more)" if len(files) > 8 else "")
+                                  if files else "none"))
+    if fails:
+        L.append("- Last failed commands: " + "; ".join(f"`{trunc(c, 90)}`" for c in fails[-2:][::-1]))
+    L.append("- Last requests:")
+    for p in prompts[-2:]:
+        L.append(f"  - {trunc(p, 220)}")
+    if not prompts:
+        L.append("  - (none)")
+    if git is None:
+        pass
+    elif not git:
+        L.append("- Uncommitted: clean")
+    else:
+        L.append(f"- Uncommitted ({len(git)}): " + "; ".join(trunc(g, 60) for g in git[:6])
+                 + (" …" if len(git) > 6 else ""))
+    L.append(BC_CLOSE)
+    return "\n".join(L) + "\n"
+
+
+def cmd_breadcrumb(d):
+    cfg = config()
+    if not cfg["enabled"]:
+        return
+    cwd = d.get("cwd") or os.getcwd()
+    root = project_root(cwd)
+    tp = thread_path(root, cfg)
+    existing = read(tp)
+    files, fails, prompts = [], [], []
+    if d.get("transcript_path"):
+        files, fails, prompts = analyse(d["transcript_path"], root)
+    # Don't litter: create a new thread only if real work happened.
+    if existing is None and not (files or len(prompts) >= 2):
+        return
+    bc = build_breadcrumb(files, fails, prompts, git_changes(root), d.get("session_id", ""))
+    body = BC_RE.sub("", existing) if existing else skeleton()
+    body = body.rstrip("\n") + "\n\n" + bc
+    write_atomic(tp, body)
+    enforce(tp, cfg)
+
+
+def skeleton():
+    return "# Thread\n\n" + "\n\n".join(f"## {s}\n" for s in SECTIONS)
+
+
+# ---------- size cap ----------
+
+def enforce(tp, cfg):
+    """Keep the file at or under max_lines: roll the oldest Done bullets into the log,
+    then, if still over, trim the oldest lines of Done/Gotchas content. The breadcrumb stays."""
+    text = read(tp)
+    if text is None:
+        return
+    cap = int(cfg["max_lines"])
+    lines = text.rstrip("\n").split("\n")
+    rolled = []
+
+    def done_range():
+        s = next((i for i, l in enumerate(lines) if re.match(r"##\s+Done\b", l)), None)
+        if s is None:
+            return None
+        e = next((i for i in range(s + 1, len(lines)) if lines[i].startswith("## ") or lines[i] == BC_OPEN), len(lines))
+        return s, e
+
+    while len(lines) > cap:
+        r = done_range()
+        if not r:
+            break
+        s, e = r
+        idx = next((i for i in range(s + 1, e) if lines[i].strip()), None)
+        if idx is None:
+            break
+        rolled.append(lines.pop(idx))
+    if rolled:
+        lp = log_path(tp)
+        old = read(lp) or "# Thread archive\n"
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        write_atomic(lp, old.rstrip("\n") + f"\n\n## Rolled off {stamp}\n" + "\n".join(rolled) + "\n")
+    out = "\n".join(lines).rstrip("\n") + "\n"
+    if len(lines) > cap:
+        log(f"thread still {len(lines)} lines after rollover (cap {cap})")
+    if out != text:
+        write_atomic(tp, out)
+
+
+# ---------- SessionStart ----------
+
+def age_str(secs):
+    secs = max(0, int(secs))
+    if secs < 90:
+        return "moments"
+    if secs < 5400:
+        return f"{round(secs / 60)} min"
+    if secs < 129600:
+        return f"{round(secs / 3600)} h"
+    return f"{round(secs / 86400)} days"
+
+
+def split_sections(text):
+    """-> list of (name, [lines]); name '' is the preamble, 'Where it stopped' the breadcrumb."""
+    secs, cur = [("", [])], None
+    for l in text.rstrip("\n").split("\n"):
+        if l in (BC_OPEN, BC_CLOSE):
+            continue
+        m = re.match(r"##\s+(.*)", l)
+        if m:
+            name = m.group(1).strip()
+            secs.append(("Where it stopped" if name.startswith("Where it stopped") else name, [l]))
+        else:
+            secs[-1][1].append(l)
+    return secs
+
+
+def compact(text, budget_chars):
+    secs = split_sections(text)
+    prio = ["Goal", "In progress", "Next", "Where it stopped", "Decisions", "Gotchas",
+            "Open questions", "Done"]
+    rank = lambda n: prio.index(n) if n in prio else len(prio)
+    keep = {}
+    used = 0
+    for i in sorted(range(len(secs)), key=lambda i: (rank(secs[i][0]), i)):
+        name, ls = secs[i]
+        ls = [l for l in ls]
+        # drop empty sections (header only)
+        if name and not any(x.strip() for x in ls[1:]):
+            continue
+        # strip blank runs
+        ls = [l for j, l in enumerate(ls) if l.strip() or (j and ls[j - 1].strip())]
+        chunk = "\n".join(ls)
+        if used + len(chunk) + 1 <= budget_chars:
+            keep[i] = ls
+            used += len(chunk) + 1
+        else:
+            room = budget_chars - used
+            if room > 80:
+                cut = []
+                n = 0
+                for l in (ls[:1] + ls[1:][::-1] if name == "Done" else ls):
+                    if n + len(l) + 1 > room - 20:
+                        break
+                    cut.append(l)
+                    n += len(l) + 1
+                if name == "Done":
+                    cut = cut[:1] + cut[1:][::-1]
+                keep[i] = cut + ["…(truncated; full thread in file)"]
+                used = budget_chars
+    return "\n".join("\n".join(keep[i]) for i in sorted(keep) if keep[i]).strip()
+
+
+def cmd_start(d):
+    cfg = config()
+    if not cfg["enabled"]:
+        return
+    root = project_root(d.get("cwd") or os.getcwd())
+    tp = thread_path(root, cfg)
+    text = read(tp)
+    if not text or not text.strip():
+        return
+    age = time.time() - os.path.getmtime(tp)
+    if age > float(cfg["stale_days"]) * 86400:
+        ctx = (f"Clotho: a thread from {age_str(age)} ago exists at {tp} (stale, not loaded). "
+               f"Read it only if the user's task relates to it.")
+    else:
+        body = compact(text, int(cfg["inject_max_tokens"]) * 4)
+        if not body:
+            return
+        ctx = (f"## Thread from {age_str(age)} ago (Clotho, {tp})\n"
+               "Where the work stood when the last session ended. Treat it as a handoff: "
+               "verify against the repo before relying on details. "
+               "`/clotho:wrap` updates it.\n\n" + body)
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    hooky = cmd in ("start", "breadcrumb")
+    try:
+        if hooky:
+            d = hook_input()
+            {"start": cmd_start, "breadcrumb": cmd_breadcrumb}[cmd](d)
+        else:
+            cfg = config()
+            tp = thread_path(project_root(os.getcwd()), cfg)
+            if cmd == "path":
+                print(tp)
+            elif cmd == "enforce":
+                enforce(tp, cfg)
+            elif cmd == "show":
+                t = read(tp)
+                print(t if t else f"(no thread yet at {tp})")
+            else:
+                print(__doc__)
+                return 2
+    except Exception as e:
+        log(f"{cmd} failed: {type(e).__name__}: {e}")
+        if not hooky:
+            raise
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

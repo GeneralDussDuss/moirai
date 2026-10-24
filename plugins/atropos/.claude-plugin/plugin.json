@@ -1,0 +1,7 @@
+{
+  "name": "atropos",
+  "version": "0.1.0",
+  "description": "Cuts the thread on runaway sessions: tool-call loops, repeated failing commands, subagent overspawn, context bloat and blown budgets.",
+  "author": { "name": "badussy" },
+  "license": "MIT"
+}

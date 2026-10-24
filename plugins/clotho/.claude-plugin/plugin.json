@@ -1,0 +1,7 @@
+{
+  "name": "clotho",
+  "version": "0.1.0",
+  "description": "Spins the thread: a small per-project handoff file that every new session starts with, across /clear and compaction. /clotho:wrap writes it, hooks keep a breadcrumb, SessionStart loads it.",
+  "author": { "name": "badussy" },
+  "license": "MIT"
+}

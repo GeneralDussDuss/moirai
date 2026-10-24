@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Argus audit: list every claim in a transcript with its evidence status.
+
+Usage: argus-audit [TRANSCRIPT.jsonl] [--last N] [--all] [--days N] [--json] [--quiet]
+
+  no path   newest transcript of the current directory's project
+  --all     scan every transcript under ~/.claude/projects (newest first)
+  --days N  with --all: only files modified in the last N days
+  --last N  only the last N turns of each transcript
+  --json    machine-readable output
+Status: OK supported | STALE ran before last edit | FAILED run errored |
+        MISSING never ran | SKIP cannot judge (delegated / no code edits)
+"""
+import glob
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import argus_core as core
+
+PROJECTS = os.path.expanduser("~/.claude/projects")
+BAD = ("missing", "stale", "failed")
+
+
+def default_transcript():
+    enc = os.getcwd().replace("/", "-").replace(".", "-")
+    for d in (os.path.join(PROJECTS, enc), None):
+        files = glob.glob(os.path.join(d, "*.jsonl")) if d else glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
+        if files:
+            return max(files, key=os.path.getmtime)
+    return None
+
+
+def scan(path, cfg, last=None):
+    turns = core.split_turns(core.read_entries(path))
+    if last:
+        turns = turns[-last:]
+    out = []
+    for n, t in enumerate(turns):
+        for r in core.check_turn(t, cfg):
+            out.append(dict(r, turn=n, prompt=" ".join(t["prompt"].split())[:80], file=path))
+    return out, len(turns)
+
+
+def main(argv):
+    cfg = core.load_config()
+    as_json = "--json" in argv
+    allp = "--all" in argv
+    days = last = None
+    paths = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--days":
+            days = float(argv[i + 1]); i += 1
+        elif a == "--last":
+            last = int(argv[i + 1]); i += 1
+        elif not a.startswith("--"):
+            paths.append(os.path.expanduser(a))
+        i += 1
+    if allp:
+        paths = sorted(glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")), key=os.path.getmtime, reverse=True)
+        if days:
+            cut = time.time() - days * 86400
+            paths = [p for p in paths if os.path.getmtime(p) >= cut]
+    elif not paths:
+        p = default_transcript()
+        if not p:
+            print("argus: no transcript found")
+            return 1
+        paths = [p]
+    rows, nturns = [], 0
+    for p in paths:
+        try:
+            r, n = scan(p, cfg, last)
+        except Exception as e:
+            print("argus: skipped %s (%r)" % (p, e), file=sys.stderr)
+            continue
+        rows += r
+        nturns += n
+    if as_json:
+        print(json.dumps({"transcripts": len(paths), "turns": nturns, "claims": rows}, indent=1))
+        return 0
+    counts = {}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    print("argus: %d transcript(s), %d turn(s), %d claim(s): %s" % (
+        len(paths), nturns, len(rows), ", ".join("%d %s" % (v, k.upper()) for k, v in sorted(counts.items())) or "none"))
+    for r in rows:
+        if allp and r["status"] not in BAD:
+            continue
+        print("\n[%s] %s  (%s turn %d)" % (r["status"].upper(), r["kind"], os.path.basename(r["file"])[:8], r["turn"]))
+        print("  prompt: %s" % r["prompt"])
+        print("  claim:  %s" % r["snippet"])
+        print("  why:    %s" % r["detail"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

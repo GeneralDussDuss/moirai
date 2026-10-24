@@ -1,0 +1,12 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "moirai",
+  "description": "The Fates for Claude Code: spin, measure and cut every session, with Argus watching the claims and Cerberus at the gate.",
+  "owner": { "name": "badussy" },
+  "plugins": [
+    { "name": "clotho",   "source": "./plugins/clotho",   "category": "productivity", "description": "Spins the thread: session handoffs that survive /clear and compaction" },
+    { "name": "atropos",  "source": "./plugins/atropos",  "category": "productivity", "description": "Cuts the thread: stops loops, runaway context and blown budgets" },
+    { "name": "argus",    "source": "./plugins/argus",    "category": "development",  "description": "Hundred eyes on Claude's claims: no 'tests pass' without a test run" },
+    { "name": "cerberus", "source": "./plugins/cerberus", "category": "security",     "description": "Guards the gate: secret egress, destructive commands, prompt injection" }
+  ]
+}

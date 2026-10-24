@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""Atropos: cuts the thread on runaway Claude Code sessions.
+
+  atropos hook                       hook entry (reads the hook JSON on stdin)
+  atropos status [--session ID]      print counters, context size, estimated cost
+  atropos spare  [--session ID] [--cap USD|off]
+                                     reset counters / change this session's cap
+
+State:  ~/.local/state/atropos/<session_id>.json   (ATROPOS_STATE_DIR overrides)
+Config: ~/.config/atropos/config.json              (ATROPOS_CONFIG overrides)
+
+A hook must never break the session: any internal error is logged to
+<state dir>/errors.log and the hook exits 0 with no output.
+"""
+import glob
+import hashlib
+import json
+import os
+import sys
+import time
+
+STATE_DIR = os.environ.get("ATROPOS_STATE_DIR") or os.path.expanduser("~/.local/state/atropos")
+CONFIG = os.environ.get("ATROPOS_CONFIG") or os.path.expanduser("~/.config/atropos/config.json")
+
+DEFAULTS = {
+    "enabled": True,
+    "loop_warn": 3,            # identical tool+input this many times in the window: warn
+    "loop_deny": 5,            # ...this many: deny
+    "loop_window": 40,         # only the last N tool calls count
+    "loop_ignore": ["TodoWrite", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "Monitor", "SendMessage"],
+    "bash_fail_deny": 3,       # deny the Nth identical Bash attempt once N-1 have failed
+    "agent_warn": 4,           # more than this many Agent/Task calls in one user turn: warn
+    "agent_ask": 8,            # more than this many: ask
+    "context_warn": [200000, 400000],  # tokens; one-time warning per threshold
+    "budget_cap_usd": None,    # estimated session cost cap in USD; None = off
+    "prices": {},              # per-million-token overrides: {"opus": [in, out, cache_read]}
+}
+
+# $ per million tokens: input, output, cache read. Cache writes: 1.25x input
+# (5 min) and 2x input (1 hour). List-price ESTIMATES by model family; override
+# any of them with "prices" in the config. Newest-first substring match.
+PRICES = [
+    ("fable-5-1", (10.00, 50.00, 0.25)),
+    ("opus-5-5", (4.00, 20.00, 0.20)),
+    ("fable", (10.00, 50.00, 1.00)),
+    ("opus", (5.00, 25.00, 0.50)),
+    ("sonnet", (2.00, 10.00, 0.20)),
+    ("haiku", (0.10, 0.50, 0.01)),
+]
+UNKNOWN_FAMILY = (5.00, 25.00, 0.50)  # unknown model: assume Opus-class, never undercount
+
+
+# ---------------------------------------------------------------- plumbing
+
+def log_error():
+    try:
+        import traceback
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(os.path.join(STATE_DIR, "errors.log"), "a") as f:
+            f.write(time.strftime("%F %T ") + traceback.format_exc() + "\n")
+    except Exception:
+        pass
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as f:
+            user = json.load(f)
+        if isinstance(user, dict):
+            cfg.update({k: v for k, v in user.items() if k in DEFAULTS})
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def state_path(sid):
+    safe = "".join(c for c in str(sid) if c.isalnum() or c in "-_") or "unknown"
+    return os.path.join(STATE_DIR, safe + ".json")
+
+
+def new_state():
+    return {"calls": [], "bash_fail": {}, "turn_agents": 0, "turn": 0, "ctx_warned": [],
+            "transcript": None, "cost": {"files": {}, "seen": [], "usd": 0.0},
+            "cap_override": None, "budget_next_ask": None, "stats": {"loops_denied": 0, "fails_denied": 0}}
+
+
+def load_state(sid):
+    st = new_state()
+    try:
+        with open(state_path(sid)) as f:
+            st.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return st
+
+
+def save_state(sid, st):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    p = state_path(sid)
+    tmp = p + ".%d.tmp" % os.getpid()
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+    os.replace(tmp, p)
+
+
+def sig(tool, tool_input):
+    raw = json.dumps(tool_input, sort_keys=True, default=str)
+    return hashlib.sha1((tool + "\0" + raw).encode()).hexdigest()[:12]
+
+
+# ------------------------------------------------------------- transcripts
+
+def family_prices(model, cfg):
+    m = (model or "").lower()
+    for fam, p in PRICES:
+        if fam in m:
+            return tuple(cfg.get("prices", {}).get(fam, p))
+    return UNKNOWN_FAMILY
+
+
+def last_context(path):
+    """Context size of the latest main-thread assistant message, from the file tail."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 400000))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        if '"usage"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("type") != "assistant" or d.get("isSidechain"):
+            continue
+        u = (d.get("message") or {}).get("usage") or {}
+        return (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                + u.get("cache_creation_input_tokens", 0))
+    return None
+
+
+def transcript_files(path):
+    files = [path] if path else []
+    if path:
+        files += sorted(glob.glob(os.path.join(path[:-6], "subagents", "*.jsonl")))
+    return [f for f in files if os.path.isfile(f)]
+
+
+def update_cost(st, cfg):
+    """Incrementally price new transcript bytes (main thread plus subagents)."""
+    c = st["cost"]
+    seen = set(c["seen"])
+    for fp in transcript_files(st.get("transcript")):
+        ent = c["files"].setdefault(fp, 0)
+        try:
+            size = os.path.getsize(fp)
+            if size < ent:
+                ent = 0
+            if size == ent:
+                continue
+            with open(fp, "rb") as f:
+                f.seek(ent)
+                chunk = f.read()
+        except OSError:
+            continue
+        end = chunk.rfind(b"\n") + 1  # only whole lines; a partial last line waits
+        for line in chunk[:end].decode("utf-8", "replace").splitlines():
+            if '"usage"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            msg = d.get("message") or {}
+            u = msg.get("usage")
+            if d.get("type") != "assistant" or not u:
+                continue
+            mid = msg.get("id") or d.get("uuid")
+            if mid in seen:
+                continue
+            seen.add(mid)
+            pin, pout, pcr = family_prices(msg.get("model"), cfg)
+            cc = u.get("cache_creation") or {}
+            w1h = cc.get("ephemeral_1h_input_tokens", 0)
+            w5m = cc.get("ephemeral_5m_input_tokens", 0)
+            if not cc:
+                w5m = u.get("cache_creation_input_tokens", 0)
+            c["usd"] += (u.get("input_tokens", 0) * pin + u.get("output_tokens", 0) * pout
+                         + u.get("cache_read_input_tokens", 0) * pcr
+                         + w5m * pin * 1.25 + w1h * pin * 2.0) / 1e6
+        c["files"][fp] = ent + end
+    c["seen"] = list(seen)[-5000:]
+    return c["usd"]
+
+
+# ------------------------------------------------------------------- hooks
+
+def out_pre(decision=None, reason=None, context=None):
+    h = {"hookEventName": "PreToolUse"}
+    if decision:
+        h["permissionDecision"] = decision
+        h["permissionDecisionReason"] = reason
+    if context:
+        h["additionalContext"] = context
+    return {"hookSpecificOutput": h}
+
+
+def context_notes(st, cfg):
+    notes = []
+    ctx = last_context(st.get("transcript")) if st.get("transcript") else None
+    if ctx is None:
+        return notes
+    crossed = [t for t in sorted(cfg["context_warn"]) if ctx >= t]
+    if crossed and crossed[-1] not in st["ctx_warned"]:
+        t = crossed[-1]  # say only the highest crossed mark; lower ones count as done
+        st["ctx_warned"] = sorted(set(st["ctx_warned"] + crossed))
+        notes.append("Atropos: context is about %dk tokens (past the %dk mark). Every further step "
+                     "re-reads it. Suggest /compact (or /clear with a handoff) to the user, or wrap "
+                     "up the current task soon." % (ctx // 1000, t // 1000))
+    return notes
+
+
+def handle_prompt(p, st, cfg):
+    st["turn"] += 1
+    st["turn_agents"] = 0
+    if p.get("transcript_path"):
+        st["transcript"] = p["transcript_path"]
+    notes = context_notes(st, cfg)
+    if notes:
+        return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                       "additionalContext": " ".join(notes)}}
+    return None
+
+
+def handle_pre(p, st, cfg):
+    tool, tin = p.get("tool_name", ""), p.get("tool_input") or {}
+    notes = []
+    if p.get("transcript_path"):
+        st["transcript"] = p["transcript_path"]
+    s = sig(tool, tin)
+
+    # 1. loop cut
+    if tool not in cfg["loop_ignore"]:
+        st["calls"] = (st["calls"] + [s])[-int(cfg["loop_window"]):]
+        n = st["calls"].count(s)
+        if n >= cfg["loop_deny"]:
+            st["stats"]["loops_denied"] += 1
+            return out_pre("deny", "Atropos: this exact %s call has now been made %d times in the last %d "
+                           "tool calls with identical input. It is a loop. Stop repeating it: change the "
+                           "approach, try something different, or ask the user for help."
+                           % (tool, n, len(st["calls"])))
+        if n >= cfg["loop_warn"]:
+            notes.append("Atropos: identical %s call made %d times recently; another %d and it will be "
+                         "blocked. Change approach if it is not working." % (tool, n, cfg["loop_deny"] - n))
+
+    if tool == "Bash":
+        fails = st["bash_fail"].get(s, 0)
+        if fails >= cfg["bash_fail_deny"] - 1:
+            st["stats"]["fails_denied"] += 1
+            return out_pre("deny", "Atropos: this exact Bash command has already failed %d times. Running "
+                           "it again will not help. Diagnose why it fails, change the command, or ask the "
+                           "user." % fails)
+
+    # 2. budget cap
+    cap = st["cap_override"] if st["cap_override"] is not None else cfg["budget_cap_usd"]
+    if cap:
+        spent = update_cost(st, cfg)
+        nxt = st["budget_next_ask"]
+        if spent > cap and (nxt is None or spent > nxt):
+            st["budget_next_ask"] = spent + cap * 0.25
+            return out_pre("ask", "Atropos: estimated session spend is $%.2f, over the $%.2f cap "
+                           "(list-price estimate). Continue?" % (spent, cap))
+
+    # 3. subagent overspawn
+    if tool in ("Agent", "Task"):
+        st["turn_agents"] += 1
+        n = st["turn_agents"]
+        if n > cfg["agent_ask"]:
+            return out_pre("ask", "Atropos: %d subagents spawned in this one turn. Confirm you want "
+                           "another." % n)
+        if n == cfg["agent_warn"] + 1:
+            notes.append("Atropos: %d subagents spawned this turn. Prefer fewer, larger tasks; the user "
+                         "will be asked past %d." % (n, cfg["agent_ask"]))
+
+    # 4. context bloat
+    notes += context_notes(st, cfg)
+    return out_pre(context=" ".join(notes)) if notes else None
+
+
+def handle_post(p, st, cfg, failed):
+    if p.get("tool_name") != "Bash":
+        return None
+    s = sig("Bash", p.get("tool_input") or {})
+    if failed:
+        st["bash_fail"][s] = st["bash_fail"].get(s, 0) + 1
+        n = st["bash_fail"][s]
+        if len(st["bash_fail"]) > 200:
+            st["bash_fail"] = {s: n}
+        if n >= cfg["bash_fail_deny"] - 1:
+            return {"hookSpecificOutput": {"hookEventName": "PostToolUseFailure", "additionalContext":
+                    "Atropos: this exact command has now failed %d times. Do not run it again unchanged; "
+                    "diagnose the cause or ask the user." % n}}
+    else:
+        st["bash_fail"].pop(s, None)
+    return None
+
+
+def run_hook():
+    try:
+        p = json.load(sys.stdin)
+        sid = p.get("session_id")
+        cfg = load_config()
+        if not sid or not cfg["enabled"]:
+            return
+        st = load_state(sid)
+        ev = p.get("hook_event_name")
+        if ev == "UserPromptSubmit":
+            res = handle_prompt(p, st, cfg)
+        elif ev == "PreToolUse":
+            res = handle_pre(p, st, cfg)
+        elif ev == "PostToolUse":
+            res = handle_post(p, st, cfg, False)
+        elif ev == "PostToolUseFailure":
+            res = handle_post(p, st, cfg, True)
+        else:
+            res = None
+        save_state(sid, st)
+        if res:
+            sys.stdout.write(json.dumps(res))
+    except Exception:
+        log_error()
+    sys.exit(0)
+
+
+# --------------------------------------------------------------------- CLI
+
+def find_session(arg):
+    if arg:
+        return arg
+    files = glob.glob(os.path.join(STATE_DIR, "*.json"))
+    if not files:
+        return None
+    return os.path.basename(max(files, key=os.path.getmtime))[:-5]
+
+
+def find_transcript(sid, st):
+    if st.get("transcript") and os.path.isfile(st["transcript"]):
+        return st["transcript"]
+    g = glob.glob(os.path.expanduser("~/.claude/projects/*/%s.jsonl" % sid))
+    return g[0] if g else None
+
+
+def parse_args(argv):
+    a = {"session": None, "cap": None}
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--session" and i + 1 < len(argv):
+            a["session"] = argv[i + 1]
+            i += 1
+        elif argv[i] == "--cap" and i + 1 < len(argv):
+            a["cap"] = argv[i + 1]
+            i += 1
+        i += 1
+    if a["session"] in ("", "${CLAUDE_SESSION_ID}"):
+        a["session"] = None
+    return a
+
+
+def cmd_status(a):
+    cfg = load_config()
+    sid = find_session(a["session"])
+    if not sid:
+        print("Atropos: no session state yet (hooks have not run).")
+        return
+    st = load_state(sid)
+    tp = find_transcript(sid, st)
+    st["transcript"] = tp
+    ctx = last_context(tp) if tp else None
+    usd = update_cost(st, cfg) if tp else 0.0
+    save_state(sid, st)
+    cap = st["cap_override"] if st["cap_override"] is not None else cfg["budget_cap_usd"]
+    worst = max(st["calls"].count(x) for x in set(st["calls"])) if st["calls"] else 0
+    worst_fail = max(st["bash_fail"].values()) if st["bash_fail"] else 0
+    print("Atropos status, session %s" % sid[:8])
+    print("  repeated call  worst %d identical in last %d calls (warn %d, deny %d)"
+          % (worst, len(st["calls"]), cfg["loop_warn"], cfg["loop_deny"]))
+    print("  failing bash   worst %d identical failures (retry denied at %d)"
+          % (worst_fail, cfg["bash_fail_deny"] - 1))
+    print("  subagents      %d this turn (warn >%d, ask >%d)"
+          % (st["turn_agents"], cfg["agent_warn"], cfg["agent_ask"]))
+    print("  context        %s tokens (warn at %s)"
+          % ("%dk" % (ctx // 1000) if ctx is not None else "unknown",
+             "/".join("%dk" % (t // 1000) for t in cfg["context_warn"])))
+    print("  est. cost      $%.2f list price, cap %s"
+          % (usd, "$%.2f" % cap if cap else "off"))
+    print("  cuts so far    %d loops denied, %d failing retries denied"
+          % (st["stats"]["loops_denied"], st["stats"]["fails_denied"]))
+
+
+def cmd_spare(a):
+    sid = find_session(a["session"])
+    if not sid:
+        print("Atropos: no session state to reset.")
+        return
+    st = load_state(sid)
+    st["calls"], st["bash_fail"], st["turn_agents"], st["ctx_warned"] = [], {}, 0, []
+    st["budget_next_ask"] = None
+    msg = "counters reset, context warnings re-armed"
+    if a["cap"]:
+        if a["cap"].lower() in ("off", "none", "0"):
+            st["cap_override"] = 0
+            msg += "; budget cap removed for this session"
+        else:
+            try:
+                st["cap_override"] = float(a["cap"].lstrip("$"))
+                msg += "; budget cap for this session is $%.2f" % st["cap_override"]
+            except ValueError:
+                print("Atropos: bad --cap value %r (use a number or 'off')." % a["cap"])
+                return
+    save_state(sid, st)
+    print("Atropos: " + msg + ".")
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "hook":
+        run_hook()
+    elif cmd == "status":
+        cmd_status(parse_args(sys.argv[2:]))
+    elif cmd == "spare":
+        cmd_spare(parse_args(sys.argv[2:]))
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()
